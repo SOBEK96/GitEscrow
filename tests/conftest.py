@@ -148,6 +148,12 @@ def mock_github(
     decoys=(),
     report: object = "match",
     commit_url_repo=None,
+    run_id=101,
+    compare_status=None,
+    compare_http=200,
+    pr=None,
+    pr_base=BRANCH,
+    pr_head=None,
 ):
     """Mock every GitHub endpoint the verifier reads.
 
@@ -171,13 +177,17 @@ def mock_github(
         "html_url": f"https://github.com/{shown}/commit/{sha}",
     }
     vm.mock_web(rf"{api}/commits/{sha}$", {"status": 200, "body": json.dumps(body)})
-    vm.mock_web(rf"{api}/compare/", {"status": 200, "body": json.dumps({"status": "behind" if on_branch else "diverged"})})
+    cmp_status = compare_status or ("behind" if on_branch else "diverged")
+    vm.mock_web(rf"{api}/compare/", {"status": compare_http, "body": json.dumps({"status": cmp_status})})
+    if pr is not None:
+        vm.mock_web(rf"{api}/pulls/{pr}$", {"status": 200, "body": json.dumps(
+            {"head": {"sha": pr_head or sha}, "base": {"ref": pr_base}, "state": "open"})})
 
     runs = list(decoys)
     if ci != "absent":
         text = check_text if check_text is not None else check_text_for(tests, failed, coverage, critical)
         runs.append({
-            "id": 101, "name": check_name, "app": {"id": app_id},
+            "id": run_id, "name": check_name, "app": {"id": app_id},
             "status": "in_progress" if ci == "pending" else "completed",
             "conclusion": None if ci == "pending" else ("failure" if ci == "failure" else "success"),
             "output": {"title": "CI", "summary": text, "text": ""},

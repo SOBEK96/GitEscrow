@@ -54,7 +54,7 @@ export const FAILURE_LABELS: Record<string, string> = {
   commit_not_found: "Commit does not exist on the repository",
   spoofed_payload: "Spoofed payload: commit belongs to another repository",
   SPOOFED_REPORT_PAYLOAD: "report.json contradicts the authentic CI check-run output",
-  commit_not_on_branch: "Commit is not part of the target branch history",
+  commit_not_on_ref: "Commit is not part of the delivery ref (target branch, branch or PR head)",
   ci_pending: "Attested check-run still running (no attempt consumed)",
   ci_attestation_missing: "No check-run with the required name from the trusted GitHub App",
   ci_failed: "The attested CI check-run failed",

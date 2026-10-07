@@ -15,7 +15,10 @@ export interface Report {
   repo_available: boolean;
   commit_exists: boolean;
   repo_match: boolean;
-  on_branch: boolean;
+  on_ref: boolean;
+  ref_checked?: boolean;
+  delivery_ref?: string;
+  check_run_id?: number;
   ci_state: CiState;
   tests_passed: number;
   tests_failed: number;
@@ -46,6 +49,8 @@ export interface Milestone {
   deadline: number;
   status: MilestoneStatus;
   submittedSha: string;
+  deliveryRef: string;
+  checkRunId: number;
   attempts: number;
   pendingPolls: number;
   verifiedAt: number;
@@ -158,11 +163,12 @@ export interface Backend {
   createEscrow(by: string, input: CreateEscrowInput): Promise<number>;
   acceptEscrow(by: string, escrowId: number): Promise<void>;
   cancelEscrow(by: string, escrowId: number): Promise<void>;
-  evaluate(by: string, milestoneId: number, sha: string): Promise<Outcome>;
+  evaluate(by: string, milestoneId: number, sha: string, deliveryRef?: string): Promise<Outcome>;
   settle(by: string, milestoneId: number): Promise<void>;
   approve(by: string, milestoneId: number): Promise<void>;
   claimDefault(by: string, milestoneId: number): Promise<string>;
   cancelFaultFree(by: string, milestoneId: number): Promise<string>;
+  thaw(by: string, milestoneId: number): Promise<string>;
   quoteDisputeBond(milestoneId: number, who: string): Promise<bigint>;
   quoteDisputeFee(milestoneId: number): Promise<bigint>;
   fileDispute(by: string, milestoneId: number, reason: string): Promise<Outcome>;

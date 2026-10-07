@@ -2,7 +2,7 @@
 """End-to-end run against the GitEscrow deployment on GenLayer Studio Next.
 
     python scripts/verify_live.py                       # default: rejected delivery -> default & slash
-    python scripts/verify_live.py --repo OWNER/REPO --sha FULL_SHA [--branch main]
+    python scripts/verify_live.py --repo OWNER/REPO --sha FULL_SHA [--branch main] [--ref pull/N]
 
 Both paths exercise real validator consensus over live GitHub data:
 
@@ -62,6 +62,7 @@ def main() -> None:
     ap.add_argument("--repo", default="octocat/Hello-World")
     ap.add_argument("--branch", default="master")
     ap.add_argument("--sha", default="")
+    ap.add_argument("--ref", default="", help="delivery ref: empty = target branch, pull/N = an unmerged PR head, or a branch")
     ap.add_argument("--deadline-seconds", type=int, default=420, help="delivery window for the default path")
     args = ap.parse_args()
 
@@ -96,11 +97,11 @@ def main() -> None:
     print(f"      locked: {cm.view(employer, addr, 'get_stats')['tvl'] / cm.ATTO:.2f} GEN TVL (all escrows)")
 
     print("[3/5] contractor submits the commit; validators verify it on GitHub")
-    cm.send(contractor, addr, "evaluate_milestone_delivery", [mid, sha])
+    cm.send(contractor, addr, "evaluate_milestone_delivery", [mid, sha, args.ref])
     m = cm.view(employer, addr, "get_milestone", [mid])
     report = json.loads(m["last_report"])
     print(f"      status={m['status']} passed={report['passed']} failures={report['failures']}")
-    print(f"      commit_exists={report['commit_exists']} on_branch={report['on_branch']} ci={report['ci_state']} "
+    print(f"      commit_exists={report['commit_exists']} on_ref={report['on_ref']} ci={report['ci_state']} "
           f"tests={report['tests_passed']} coverage_bps={report['coverage_bps']} critical={report['critical_findings']}")
 
     if report["passed"]:

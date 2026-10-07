@@ -25,7 +25,7 @@ export function ConsensusPanel({ outcome, report, minTests, minCoverageBps, chec
             <ul className="divide-y divide-white/5">
               <Check ok={r.repo_available} label="Repository reachable" detail={r.repo_available ? "bound by numeric id (rename-proof)" : "deleted, private or blocked — external fault"} />
               <Check ok={r.repo_available ? r.commit_exists : null} label="Commit authenticity" detail={r.commit_exists ? "SHA exists in repository" : "SHA not found via GitHub API"} />
-              <Check ok={r.commit_exists ? r.on_branch : null} label="On target branch" detail="compare API: identical | behind" />
+              <Check ok={r.commit_exists ? r.on_ref : null} label={r.ref_checked === false ? "Delivery ref (not re-checked in disputes)" : "On delivery ref"} detail={r.ref_checked === false ? "dispute judges the delivered SHA itself" : `${r.delivery_ref ? r.delivery_ref : "target branch"} contains the commit`} />
               <Check ok={r.commit_exists ? r.repo_match : null} label="Payload provenance" detail={r.repo_match ? "commit payload bound to this repository" : "commit payload from another repository"} />
               <Check ok={r.commit_exists ? r.ci_state === "success" : null} label="Attested check-run" detail={`${checkName ?? "check"} · app ${appId ?? "?"} · state: ${r.ci_state}`} />
               <Check ok={r.commit_exists && r.ci_state !== "none" && r.ci_state !== "pending" ? r.tests_passed >= minTests && r.tests_failed === 0 : null} label="Test results"

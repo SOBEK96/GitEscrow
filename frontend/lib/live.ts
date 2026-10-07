@@ -44,7 +44,7 @@ function toMilestone(m: Any): Milestone {
   return {
     id: num(m.id), escrowId: num(m.escrow_id), index: num(m.index), title: m.title, reward: big(m.reward),
     bond: big(m.bond), expectedSha: m.expected_sha, checkName: m.check_name, appId: num(m.app_id), minTests: num(m.min_tests), minCoverageBps: num(m.min_coverage_bps),
-    deadline: num(m.deadline), status: m.status, submittedSha: m.submitted_sha, attempts: num(m.attempts),
+    deadline: num(m.deadline), status: m.status, submittedSha: m.submitted_sha, deliveryRef: m.delivery_ref ?? "", checkRunId: num(m.check_run_id), attempts: num(m.attempts),
     pendingPolls: num(m.pending_polls), verifiedAt: num(m.verified_at), releaseAt: num(m.release_at),
     resubmitUntil: num(m.resubmit_until), frozenAt: num(m.frozen_at), consentMask: num(m.consent_mask),
     disputeCount: num(m.dispute_count), nextDisputeBond: big(m.next_dispute_bond), nextDisputeFee: big(m.next_dispute_fee), lastReport: parseReport(m.last_report),
@@ -197,6 +197,11 @@ export class LiveBackend implements Backend {
     return (await this.read("get_milestone", [BigInt(id)])).status;
   }
 
+  async thaw(_by: string, id: number): Promise<string> {
+    await this.write("thaw_milestone", [BigInt(id)]);
+    return (await this.read("get_milestone", [BigInt(id)])).status;
+  }
+
   async quoteDisputeFee(milestoneId: number): Promise<bigint> {
     return big(await this.read("quote_dispute_fee", [BigInt(milestoneId)]));
   }
@@ -212,8 +217,8 @@ export class LiveBackend implements Backend {
     return { report, trace: traceFromReceipt(tx, report) };
   }
 
-  async evaluate(_by: string, milestoneId: number, sha: string): Promise<Outcome> {
-    const tx = await this.write("evaluate_milestone_delivery", [BigInt(milestoneId), sha]);
+  async evaluate(_by: string, milestoneId: number, sha: string, deliveryRef = ""): Promise<Outcome> {
+    const tx = await this.write("evaluate_milestone_delivery", [BigInt(milestoneId), sha, deliveryRef]);
     return this.outcome(milestoneId, tx);
   }
 

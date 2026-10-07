@@ -67,12 +67,16 @@ export function SettlementTerminal({ escrow, m, actorAddress, onOutcome }: { esc
             <Box icon={<Snowflake size={15} />} title="Frozen · external fault" tone="bad">
               <p className="text-xs leading-relaxed text-zinc-400">
                 The repository is deleted, private or unreachable, so no one can be blamed. Nobody is slashed. The contractor can revive the milestone by submitting once the repository answers.
-                Otherwise either party can cancel neutrally: the employer gets <b className="font-mono text-zinc-200">{fmtGen(m.reward)} GEN</b> back and the contractor keeps their <b className="font-mono text-zinc-200">{fmtGen(m.bond)} GEN</b> bond intact.
+                Anyone can thaw it once the repository answers (fresh 72h window, at least one fresh attempt). Otherwise either party can cancel neutrally: the employer gets <b className="font-mono text-zinc-200">{fmtGen(m.reward)} GEN</b> back and the contractor keeps their <b className="font-mono text-zinc-200">{fmtGen(m.bond)} GEN</b> bond intact.
               </p>
               <div className="mt-2 font-mono text-[11px] text-zinc-500">
                 consent: employer {(m.consentMask & 1) ? "✔" : "—"} · contractor {(m.consentMask & 2) ? "✔" : "—"}
                 {frozenFor < FREEZE_GRACE ? ` · unilateral exit in ${fmtDuration(FREEZE_GRACE - frozenFor)}` : " · unilateral exit available"}
               </div>
+              <button className="btn-ghost mr-2 mt-3" disabled={busy}
+                onClick={() => run(() => backend.thaw(actorAddress, m.id)).then((s) => s && notify("ok", "Repository reachable again — milestone thawed with a fresh 72h window"))}>
+                Thaw (repo is back)
+              </button>
               <button className="btn-ghost mt-3" disabled={!(isEmployer || isContractor) || iConsented || busy}
                 onClick={() => run(() => backend.cancelFaultFree(actorAddress, m.id)).then((s) => s && notify("ok", s === "CANCELLED_FAULT_FREE" ? "Cancelled fault-free: employer refunded, bond returned" : "Consent recorded — waiting for the counterparty"))}>
                 {iConsented ? "Consent recorded" : "Cancel fault-free"}

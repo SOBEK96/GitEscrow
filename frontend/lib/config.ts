@@ -1,5 +1,5 @@
 // Single source of truth for the live deployment this dashboard talks to.
-export const CONTRACT_ADDRESS = "0xfc5ecf7910e25c85b36c4D958c2Ea2e6F9B6e303";
+export const CONTRACT_ADDRESS = "0x1A0Fb6315dc4289Ad24D79608650a9A360748EEA";
 export const CHAIN_ID = 61997;
 export const NETWORK_NAME = "GenLayer Studio Next";
 export const RPC_URL = process.env.NEXT_PUBLIC_GENLAYER_RPC_URL ?? "https://studio-next.genlayer.com/api";

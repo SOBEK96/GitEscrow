@@ -59,7 +59,7 @@ def main() -> None:
         for name, story, mock in attacks:
             h.mock_github(vm, **mock)
             h.as_(vm, contractor)
-            report = c.evaluate_milestone_delivery(1, h.SHA)
+            report = c.evaluate_milestone_delivery(1, h.SHA, "")
             verdict = f"{RED}REJECTED{END}" if not report["passed"] else f"{GREEN}ACCEPTED{END}"
             print(f"{BOLD}{name}{END}: {story}\n  -> {verdict}  failures={report['failures']}")
             assert not report["passed"], f"attack '{name}' slipped through"
@@ -70,7 +70,7 @@ def main() -> None:
         forged = c.get_escrow(h.active_escrow(c, vm, employer, contractor))["first_milestone_id"]
         h.mock_github(vm)  # the leader sees a (fabricated) perfect world
         h.as_(vm, contractor)
-        c.evaluate_milestone_delivery(forged, h.SHA)
+        c.evaluate_milestone_delivery(forged, h.SHA, "")
         h.mock_github(vm, report=h.good_report(tests_passed=3))  # honest validators see the real repo
         agree = vm.run_validator()
         print(f"  honest validator vote: {GREEN + 'AGREE' + END if agree else RED + 'DISAGREE' + END}"

@@ -1,5 +1,5 @@
 {
-  "address": "0xfc5ecf7910e25c85b36c4D958c2Ea2e6F9B6e303",
+  "address": "0x1A0Fb6315dc4289Ad24D79608650a9A360748EEA",
   "chainId": 61997,
   "rpcUrl": "https://studio-next.genlayer.com/api",
   "abi": {
@@ -108,6 +108,10 @@
           ],
           [
             "commit_sha",
+            "string"
+          ],
+          [
+            "delivery_ref",
             "string"
           ]
         ],
@@ -228,6 +232,18 @@
         "kwparams": {},
         "readonly": false,
         "ret": "null",
+        "payable": false
+      },
+      "thaw_milestone": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "dict",
         "payable": false
       }
     }

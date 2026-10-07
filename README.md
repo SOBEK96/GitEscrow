@@ -6,7 +6,7 @@ An employer locks milestone rewards in GEN. A contractor stakes a 10-20% perform
 
 ```
 contracts/git_escrow.py   the intelligent contract (GenVM, Python)
-tests/                    93 direct-mode pytest cases (deposit math, attested CI, resubmit window, external faults, disputes, validator votes)
+tests/                    direct-mode pytest cases (deposit math, attested CI, delivery refs, dispute invariance, external faults, no-deadlock paths, validator votes)
 frontend/                 Next.js + Tailwind dashboard (live against Studio Next)
 scripts/                  deploy.py, verify_live.py, simulate_dispute.py
 deployments/              recorded Studio Next deployment
@@ -64,18 +64,24 @@ The repository is bound by its **numeric GitHub id** when the contractor accepts
 |---|-------|--------|--------------|
 | 0 | Repository reachable (not deleted, private or blocked) | `GET /repositories/{id}` | `repo_unavailable` -> **frozen**, never slashed |
 | 1 | Commit exists, payload belongs to this repository | `GET /repositories/{id}/commits/{sha}` (`sha`, `url`, `html_url` must match the repository's current `full_name`) | `commit_not_found`, `spoofed_payload` |
-| 2 | Commit is in the target branch's history | `GET .../compare/{branch}...{sha}` -> `identical` or `behind` | `commit_not_on_branch` |
+| 2 | Commit is in the **delivery ref** (see below) | `delivery_ref` = `""` target branch -> `compare/{branch}...{sha}`; `pull/N` -> `GET /pulls/N` (head SHA must equal the commit, base must be the agreed branch); any other branch -> `compare/{ref}...{sha}` | `commit_not_on_ref` |
 | 3 | **Attested CI**: the check-run with the milestone's exact `check_name`, created by the exact `app_id` (default `15368` = GitHub Actions), completed with `success`; newest re-run wins | `GET .../commits/{sha}/check-runs` | `ci_attestation_missing`, `ci_pending`, `ci_failed` |
 | 4 | Passing tests >= minimum, zero failing | parsed from **that check-run's output** (`120 passed`, `0 failed`) | `tests_below_minimum`, `tests_failing` |
 | 5 | Branch coverage >= minimum | same check-run output (`Branch coverage: 91.5%`) | `coverage_below_minimum` |
 | 6 | Zero critical lint / vulnerability findings (unknown counts as **not clean**) | same check-run output (`Critical issues: 0`) | `critical_findings` |
 | 7 | Optional `.gitescrow/report.json` must **strictly match** the check-run | `raw.githubusercontent.com/{repo}/{sha}/.gitescrow/report.json` | `SPOOFED_REPORT_PAYLOAD` |
 
+**Delivery refs - no merge veto.** `evaluate_milestone_delivery(milestone, sha, delivery_ref)` takes the place the commit lives. The default `""` is the agreed target branch. `pull/N` verifies the commit as the **head of pull request N**, which must target the agreed branch, so an *unmerged* PR whose attested check-run is green is a valid delivery: the employer cannot veto payment by declining to merge, closing the PR, or rewriting `main`. A contractor may also name any other branch of the repository. The ref only has to *contain* the commit; trust comes from the attested check-run bound to that SHA.
+
+**Disputes judge the delivered SHA, not the branch.** When a delivery is disputed, validators re-check only: the commit still exists and belongs to the repository, and the **pinned check-run** (the exact run id recorded at submission) still verifies with the same thresholds. Ref containment is deliberately *not* re-evaluated, and re-runs of the check (new run ids) are ignored. An employer who force-pushes, resets or deletes the branch after delivery, closes the PR, or re-triggers CI therefore cannot overturn a valid delivery. A dispute can only succeed if the evidence the delivery was accepted on has actually changed (the pinned run now reports failure, the run or the commit is gone).
+
 A contractor-committed `report.json` can **never** substitute for, or improve on, the CI evidence: if it is present it may only corroborate. Any claimed metric (tests, failures, coverage, critical findings) that differs from the check-run, a missing check-run behind a populated report, or a report naming another commit or repository fails the delivery with `SPOOFED_REPORT_PAYLOAD`. Check-runs from other apps or with other names are ignored entirely. Example of the attested check-run summary the parser reads:
 
 ```
 120 passed, 0 failed. Branch coverage: 91.5%. Critical issues: 0
 ```
+
+> **Workflow requirement: publish results through the Checks API.** A stock GitHub Actions job conclusion (`success`/`failure`) is not enough: validators parse the check-run's `output.title` / `output.summary` / `output.text`. Your workflow must therefore publish its test, coverage and security numbers there, either with a step that calls the Checks API (`POST /repos/{repo}/check-runs` or `PATCH /repos/{repo}/check-runs/{id}` with `output: { title, summary }`), or with an action that writes a test summary into the check-run output in the format above (`N passed`, `N failed`, `Branch coverage: X%`, `Critical issues: N`). The check-run's **name** must equal the milestone's `check_name` and it must be created by the milestone's `app_id` (`15368` for the built-in `GITHUB_TOKEN` / GitHub Actions). A job that only writes to the step summary (`$GITHUB_STEP_SUMMARY`) or uploads an artifact is invisible to the validators and will fail with `ci_attestation_missing` or `tests_below_minimum`.
 
 The validator function re-collects the evidence itself and requires the leader's `passed`, `failures`, repository availability, test count, coverage, CI state and report-mismatch flag to match exactly. A leader that forges a PASS, inflates one number, hides a report mismatch or fakes a repository outage is voted down and the round rotates. Errors are classified (`[EXPECTED]`, `[EXTERNAL]`, `[TRANSIENT]`) so rate limits, 5xx and unresolved 301s never convert into a verdict or a penalty.
 
@@ -84,21 +90,25 @@ The validator function re-collects the evidence itself and requires the leader's
 ### Milestone state machine
 
 ```
-PENDING ──evaluate: PASS──► VERIFIED ──settle (after 48h) / approve (employer)──► RELEASED
-   │  ▲                        │
-   │  └─ dispute OVERTURNED ───┤  deadline := max(deadline, now + 72h), attempts reset,
-   │     (resubmit window)     │  claim_default blocked until the new deadline passes
-   │                           └─ dispute UPHELD ──► RELEASED (disputer's bond -> contractor)
+PENDING ──evaluate(sha, delivery_ref): PASS──► VERIFIED ──settle (after 48h) / approve (employer)──► RELEASED
+   │  ▲                                          │
+   │  └─ dispute OVERTURNED (pinned evidence     │  dispute UPHELD (the delivered SHA + pinned check-run
+   │     changed): deadline := max(deadline,     │  still verify, whatever happened to the branch)
+   │     now + 72h), attempts reset              └──► RELEASED (disputer's bond -> contractor)
    │
    ├── deadline + resubmit grace passed, repo reachable, claim_default ──► DEFAULTED (refund + slashed bond)
    │
-   └── repo deleted / private / unreachable (claim_default or evaluate) ──► FROZEN_EXTERNAL_FAULT
-            ├─ contractor re-submits once the repo answers ──► PENDING (deadline >= now + 72h)
-            └─ cancel_fault_free (both consent, or 7 days + repo still gone)
-                   ──► CANCELLED_FAULT_FREE: employer refunded, contractor bond returned 100% intact
+   └── repo deleted / private / blocked (claim_default or evaluate) ──► FROZEN_EXTERNAL_FAULT
+            ├─ thaw_milestone (anyone) or evaluate, once the repo answers
+            │     ──► PENDING: deadline >= now + 72h, at least ONE fresh attempt (attempts <= 4)
+            └─ cancel_fault_free ──► CANCELLED_FAULT_FREE (employer refunded, bond returned intact)
+                  * both parties consent, or
+                  * after 7 days: repo still unreachable, OR attempts exhausted, OR deadline elapsed
 
 (OPEN escrow, employer cancel ──► CANCELLED)
 ```
+
+**No milestone can be deadlocked.** Every non-terminal state has a path that does not depend on the counterparty: `OPEN` -> employer `cancel_escrow`; `PENDING` -> delivery, or `claim_default` after the deadline; `VERIFIED` -> `settle_milestone` after 48h (no repo access needed); `FROZEN` -> `thaw_milestone` / `evaluate`, or after the 7-day cooldown a unilateral `cancel_fault_free` (the cancel is refused only while the repo is reachable *and* the contractor still has attempts *and* time left, in which case thaw/resubmit is the path). A frozen milestone whose attempts are spent can always be thawed (a fresh attempt is granted) or cancelled. Funds therefore always end in one of: contractor payout, employer refund + slash, or a fault-free refund.
 
 ### Contract surface
 
@@ -107,11 +117,12 @@ PENDING ──evaluate: PASS──► VERIFIED ──settle (after 48h) / approv
 | `create_escrow(contractor, repo, branch, title, bond_bps, milestones_json)` *payable* | employer | deposits `sum(rewards)`; 1-10 milestones, bond 1000-2000 bps |
 | `accept_escrow(id)` *payable* | contractor | posts `sum(bonds)`; a consensus round binds the repository's numeric id |
 | `cancel_escrow(id)` | employer | refund while the contractor has not bonded |
-| `evaluate_milestone_delivery(milestone, sha)` | contractor | **consensus verification**; records the report on-chain |
+| `evaluate_milestone_delivery(milestone, sha, delivery_ref)` | contractor | **consensus verification** of the commit on the target branch / a branch / `pull/N`; records the report and pins the check-run |
 | `settle_milestone(id)` | anyone | release after the 48h window |
 | `approve_milestone(id)` | employer | waive the window, release now |
 | `file_dispute(id, reason)` *payable* | employer | escalating bond + non-refundable 3% fee; fresh quorum re-verification; overturn grants a 72h resubmit window |
 | `claim_default(id)` | anyone | after deadline **and** resubmit grace: probes the repo, then refund + slashed bond to the employer (or freezes if the repo is unreachable) |
+| `thaw_milestone(id)` | anyone | revive a frozen milestone once the repo answers (fresh 72h window, >= 1 fresh attempt) |
 | `cancel_fault_free(id)` | employer / contractor | neutral exit for a frozen milestone: employer refunded, bond returned intact |
 | `get_escrow`, `get_milestone`, `list_escrows`, `get_stats`, `get_solvency`, `quote_dispute_bond`, `quote_dispute_fee`, `get_strikes` | views | |
 
@@ -148,7 +159,7 @@ fee  = max(0.02 GEN, 3% of reward)                                              
 * A dispute is resolved **in the same transaction** by a fresh quorum re-verification of the same commit, so it cannot freeze funds - the worst-case delay is one consensus round, not a time lock.
 * **Upheld delivery** (the dispute was frivolous): the bond is forfeited *to the contractor* as compensation, the fee is retained, and the milestone releases immediately. The disputer earns a strike that raises every future bond for that address.
 * **Overturned delivery** (e.g. history force-pushed after verification): the bond is refunded, the **fee is not**, and the milestone returns to `PENDING` with `deadline = max(deadline, now + 72h)` and a fresh attempt budget. `claim_default` is blocked until that window has passed, so an employer cannot disprove a delivery after the deadline and then slash the bond before the contractor can react.
-* A dispute **cannot be decided** while the repository is unreachable or the attested check-run is re-running (`ci_pending`) - the employer cannot win by deleting the repo or re-triggering CI.
+* A dispute **cannot be decided** while the repository is unreachable or the pinned check-run is `pending` - the employer cannot win by deleting the repo or re-triggering CI. It also **cannot be won by rewriting the branch**: validators judge the delivered SHA and its pinned check-run, not the branch tip.
 
 The fee makes a zero-cost harassment dispute impossible: every dispute burns at least 3% of the milestone regardless of outcome, the bond ladder bounds spam on one milestone, and strikes raise the price for repeat offenders.
 
@@ -182,13 +193,13 @@ Someone must control the repository, and whoever does can influence the evidence
 
 | Repository owner | Failure mode | What GitEscrow does about it |
 |---|---|---|
-| **Employer-owned** (contractor delivers via PR) | The employer can refuse to merge, delete the repo, or make it private to turn a good delivery into a "default" and harvest the bond | Delivery is judged against the **commit**, not the merge: a commit on the target branch with a passing attested check-run is enough. If the repo vanishes, the milestone **freezes** (`FROZEN_EXTERNAL_FAULT`) instead of defaulting, and `claim_default` refuses to slash while the repo is unreachable. |
+| **Employer-owned** (contractor delivers via PR) | The employer controls `main`, the branch protections and, unless pinned, the workflow files. They can refuse to merge, close the PR, force-push, delete the repo, make it private, or edit CI configuration | **Delivery is verified at the commit level, on the delivery ref.** A PR head (`pull/N`) with a green attested check-run is a valid delivery whether or not it is ever merged, so refusing to merge cannot block payment. Branch rewrites after delivery are ignored by disputes (the SHA and its pinned check-run are what is judged). Repo deletion / privatisation freezes the milestone instead of defaulting it, and ends in a fault-free refund out (employer refunded, bond returned). **Residual risk, disclosed:** if the employer also controls the branch *and the CI configuration* (workflow files on the base branch, required-workflow settings, the app that publishes the check-run), they can make the attested check fail for a genuinely good commit before delivery is evaluated. Protection then rests only on commit-level SHA verification plus the fault-free refund exit: the contractor is never slashed for it (an unreachable repo freezes; a failing check just burns an attempt), but can be denied *payment*. Mitigate by pinning the CI workflow in the agreed commit, using a neutral GitHub App `app_id`, or a neutral org. |
 | **Contractor-owned** | The contractor controls code, workflow and report, so they can forge the evidence, or delete the repo to dodge a slash | Evidence is bound to a **named check-run from a pinned GitHub App id**; a committed `report.json` can only corroborate it (any mismatch is `SPOOFED_REPORT_PAYLOAD`). Deletion yields the same neutral freeze, so it earns the contractor a free exit, never the employer's money. |
 | **Neutral third party** (org both sides trust) | Needs a third party; fully removes the incentive to tamper | Recommended whenever the stakes justify it. |
 
-GitEscrow therefore does not claim to remove the need for repo trust. It removes the **profitable** abuses: a party that destroys the evidence cannot slash the other side, and a party that fabricates evidence cannot beat an attested check-run. The residual risk is on the CI side: if the contractor also controls the *workflow* that produces the attested check-run (contractor-owned repo, `app_id` = GitHub Actions), they can make that workflow print flattering numbers. For that case use an employer-owned repo with a required workflow the contractor cannot edit, or pin a third-party GitHub App (`app_id`) whose output the contractor cannot influence.
+GitEscrow therefore does not claim to remove the need for repo trust. It removes the **profitable** abuses: a party that destroys the evidence cannot slash the other side, a party that refuses to merge cannot block a verified delivery, and a party that fabricates evidence cannot beat an attested check-run. The unavoidable residual risk is whoever controls the CI that publishes the check-run: a contractor-owned repo lets the contractor make that workflow print flattering numbers; an employer-owned repo lets the employer make it fail. Neither side can steal the other's *funds* through it (worst cases: a free fault-free exit, or an unpaid-but-unslashed contractor), but pick the owner, or a neutral GitHub App, accordingly.
 
-**Neutral fault-free cancellation.** Deleting, privatising or blocking the repository freezes the milestone. The contractor can revive it by submitting once the repo answers (the deadline is extended to at least `now + 72h`). Otherwise either party may `cancel_fault_free`: immediately if both consent, or after 7 days if a fresh quorum round still finds the repo unreachable. The employer's deposit is refunded and the contractor's bond is returned 100% intact; nobody is slashed and nobody is paid.
+**Neutral fault-free cancellation.** Deleting, privatising or blocking the repository (404/410/451, a non-rate-limit 403, or a `private` repo) freezes the milestone. Anyone can `thaw_milestone` once the repo answers, or the contractor can simply resubmit: the deadline is extended to at least `now + 72h` and at least one attempt is restored, so a frozen milestone never lands in a state where every call reverts. Otherwise either party may `cancel_fault_free`: immediately if both consent, or after a 7-day cooldown if a fresh quorum round still finds the repo unreachable, **or** the attempts are exhausted, **or** the deadline has elapsed. The employer's deposit is refunded and the contractor's bond is returned 100% intact; nobody is slashed and nobody is paid.
 
 ### Bonding dynamics and slashing
 
@@ -207,12 +218,12 @@ Branch heads, check-run states and repository visibility are **mutable off-chain
 
 * **72-hour dispute-resubmit window.** If a dispute overturns a delivery, `deadline = max(deadline, now + 72h)` and attempts reset, and `claim_default` stays blocked until the new deadline passes. An employer who waits for the original deadline to expire, force-pushes, disputes, and then tries to harvest the bond gets nothing: the contractor has three full days to resubmit.
 * **Non-refundable arbitration fee** (3%, floor 0.02 GEN) on every dispute, on top of the escalating refundable bond. A dispute that is cheap to file is a free option on the contractor's money; with the fee it is a guaranteed loss unless the delivery was genuinely invalidated.
-* **Re-run attacks.** A dispute is refused while the attested check-run is `pending` (re-triggering CI cannot win it) and while the repository is unreachable (hiding the repo cannot win it).
-* **Flaky re-runs.** If a re-run of the same check fails and the quorum agrees, the delivery is overturned; the contractor loses nothing but time and gets a fresh 72h window, while the employer has paid the fee. Pin deterministic CI.
+* **Re-run and rewrite attacks.** Disputes are pinned to the check-run recorded at delivery, so re-running CI (a new run id) does nothing; they never re-evaluate the branch, so force-pushing, resetting or deleting it does nothing; and they are refused while the pinned run is `pending` or the repository is unreachable. The only way to overturn is for the *pinned evidence itself* to change (the app updates that run to a failure, or the run or commit disappears), in which case the contractor gets the 72h resubmit window.
+* **Branch tip is irrelevant after delivery.** Ref containment is checked once, at submission. After that the delivery stands on its SHA.
 
 ### GitHub API rate limits near close deadlines
 
-Validators call the unauthenticated GitHub API (60 requests/hour/IP). A 403/429/5xx or unresolved 301 is classified `[TRANSIENT]`: the transaction reverts, **no attempt is consumed, and the contractor is never slashed for it**. But `claim_default`, `cancel_fault_free` and `accept_escrow` also need a successful probe, so an outage or rate-limit burst just delays them. Contractors should submit well before a deadline rather than in the last minutes, because a delivery that cannot be verified in time cannot be defended on-chain (the 72h window only starts after an overturned dispute).
+Validators call the unauthenticated GitHub API (60 requests/hour/IP). A rate-limit 403 (header or body says so), 429, 5xx or unresolved 301 is classified `[TRANSIENT]`: the transaction reverts, **no attempt is consumed, and the contractor is never slashed for it**. But `claim_default`, `cancel_fault_free` and `accept_escrow` also need a successful probe, so an outage or rate-limit burst just delays them. Contractors should submit well before a deadline rather than in the last minutes, because a delivery that cannot be verified in time cannot be defended on-chain (the 72h window only starts after an overturned dispute).
 
 ### Other limits
 
@@ -235,7 +246,7 @@ pip install -r scripts/requirements.txt genvm-lint
 
 ```bash
 genvm-lint check contracts/git_escrow.py     # lint + SDK validation: 0 errors
-pytest                                       # 93 direct-mode tests (in-memory GenVM, ~2 min)
+pytest                                       # direct-mode tests (in-memory GenVM, ~3 min)
 ```
 
 The suite covers deposit math and the bond lock-up, a passing delivery with parsed test/coverage metrics, every rejection path (too few tests, failing tests, low coverage, critical findings, missing commit, off-branch commit, CI red/pending/missing, expired deadline, spoofed report, spoofed repository payload), default + slashing, the escalating dispute ladder and strikes, and validator agreement/disagreement against swapped GitHub mocks (`direct_vm.run_validator`).

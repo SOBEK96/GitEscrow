@@ -2,10 +2,10 @@
   "network": "studio-next",
   "chain_id": 61997,
   "rpc_url": "https://studio-next.genlayer.com/api",
-  "contract_address": "0xfc5ecf7910e25c85b36c4D958c2Ea2e6F9B6e303",
-  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0xfc5ecf7910e25c85b36c4D958c2Ea2e6F9B6e303",
+  "contract_address": "0x1A0Fb6315dc4289Ad24D79608650a9A360748EEA",
+  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0x1A0Fb6315dc4289Ad24D79608650a9A360748EEA",
   "source": "contracts/git_escrow.py",
-  "source_sha256": "8c702d64dfc78b3a2907c288599daa00c746a59c638a98603d04208b9048ac62",
+  "source_sha256": "3fb611d91490632634e113f7aa18b39427f423e8ec4210775e9fdeaf25c3f947",
   "employer": "0x3B3570A48224eB6608344C62BceF2f9694fa0f09",
   "contractor": "0xF715F85826afeE221B73F78D8cf5c3942F431F2d",
   "abi": {
@@ -114,6 +114,10 @@
           ],
           [
             "commit_sha",
+            "string"
+          ],
+          [
+            "delivery_ref",
             "string"
           ]
         ],
@@ -234,6 +238,18 @@
         "kwparams": {},
         "readonly": false,
         "ret": "null",
+        "payable": false
+      },
+      "thaw_milestone": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "dict",
         "payable": false
       }
     }

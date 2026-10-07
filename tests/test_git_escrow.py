@@ -25,9 +25,9 @@ def world(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     return c, direct_vm, direct_alice, direct_bob, direct_charlie
 
 
-def deliver(c, vm, contractor, mid=1, sha=SHA):
+def deliver(c, vm, contractor, mid=1, sha=SHA, ref=""):
     as_(vm, contractor)
-    return c.evaluate_milestone_delivery(mid, sha)
+    return c.evaluate_milestone_delivery(mid, sha, ref)
 
 
 def dispute(c, vm, employer, mid=1, reason="evidence changed", bond=None):
@@ -220,7 +220,7 @@ class TestDepositAndStaking:
 class TestSuccessfulDelivery:
     def test_passing_commit_is_verified_with_telemetry(self, world):
         report = verified(world)
-        assert report["commit_exists"] and report["on_branch"] and report["repo_available"]
+        assert report["commit_exists"] and report["on_ref"] and report["repo_available"]
         assert report["ci_state"] == "success"
         assert report["tests_passed"] == 120 and report["tests_failed"] == 0
         assert report["coverage_bps"] == 9150
@@ -356,7 +356,7 @@ class TestFailedDelivery:
         assert r["failures"] == ["commit_not_found"] and not r["commit_exists"]
 
     def test_commit_not_on_target_branch(self, world):
-        assert self.attempt(world, on_branch=False)["failures"] == ["commit_not_on_branch"]
+        assert self.attempt(world, on_branch=False)["failures"] == ["commit_not_on_ref"]
 
     def test_ci_failure(self, world):
         assert "ci_failed" in self.attempt(world, ci="failure")["failures"]
@@ -600,10 +600,10 @@ class TestDisputes:
         c, vm, alice, bob, _ = world
         verified(world)
         bond = c.quote_dispute_bond(1, hx(alice))
-        mock_github(vm, on_branch=False)  # history rewritten after verification
-        out = dispute(c, vm, alice, reason="commit dropped from main by force push")
+        mock_github(vm, ci="failure", tests=3)  # the pinned check-run was later updated to a failure
+        out = dispute(c, vm, alice, reason="the attested check-run now reports a failure")
         assert out["dispute_outcome"] == "DELIVERY_OVERTURNED"
-        assert "commit_not_on_branch" in out["failures"]
+        assert "ci_failed" in out["failures"]
         m = c.get_milestone(1)
         assert m["status"] == "PENDING" and m["release_at"] == 0
         s = solvent(c)
@@ -674,8 +674,8 @@ class TestResubmitWindow:
         old_deadline = T0 + 7 * DAY
         t = T0 + 7 * DAY + 20 * HOUR  # deadline passed, dispute window still open
         vm.warp(iso(t))
-        mock_github(vm, on_branch=False)
-        out = dispute(c, vm, alice, reason="force-pushed after verification")
+        mock_github(vm, ci="failure", tests=3)
+        out = dispute(c, vm, alice, reason="check-run updated after verification")
         assert out["dispute_outcome"] == "DELIVERY_OVERTURNED"
 
         m = c.get_milestone(1)
@@ -809,14 +809,14 @@ class TestExternalFaults:
 
     def test_unilateral_cancel_only_after_grace_and_only_if_still_unreachable(self, world):
         c, vm, alice, bob, _ = world
-        active_escrow(c, vm, alice, bob)
+        active_escrow(c, vm, alice, bob, [milestone_spec(deadline=T0 + 20 * DAY)])
         mock_github(vm, repo_state="gone")
         deliver(c, vm, bob)
         vm.warp(iso(T0 + 7 * DAY - 1))
         as_(vm, alice)
         assert c.cancel_fault_free(1)["outcome"] == "CONSENT_RECORDED"
-        vm.warp(iso(T0 + 7 * DAY + 1))  # frozen at T0, grace (7d) elapsed
-        mock_github(vm)  # repository is back: unilateral cancel is refused
+        vm.warp(iso(T0 + 7 * DAY + 1))  # frozen at T0, cooldown (7d) elapsed, deadline still far away
+        mock_github(vm)  # repository is back and progress is possible: unilateral cancel is refused
         with vm.expect_revert("reachable again"):
             c.cancel_fault_free(1)
         mock_github(vm, repo_state="gone")
@@ -902,7 +902,7 @@ class TestAttemptConservation:
         active_escrow(c, vm, alice, bob)
         mock_github(vm, ci="pending", on_branch=False)
         r = deliver(c, vm, bob)
-        assert "commit_not_on_branch" in r["failures"]
+        assert "commit_not_on_ref" in r["failures"]
         assert c.get_milestone(1)["attempts"] == 1
 
 
@@ -962,3 +962,239 @@ class TestValidatorConsensus:
         deliver(c, vm, bob)  # leader sees it gone
         mock_github(vm)  # honest validators still see it
         assert vm.run_validator() is False
+
+
+# ===== Branch-tip rewriting after delivery must not overturn a valid delivery
+class TestDisputeInvariance:
+    def test_branch_force_push_after_delivery_does_not_overturn(self, world):
+        c, vm, alice, bob, _ = world
+        verified(world)
+        mock_github(vm, on_branch=False)  # the employer force-pushed: the SHA is no longer in main's history
+        out = dispute(c, vm, alice, reason="force-pushed main, delivered commit is gone from history")
+        assert out["dispute_outcome"] == "UPHELD_DELIVERY"
+        assert out["ref_checked"] is False and out["passed"] is True
+        assert c.get_milestone(1)["status"] == "RELEASED"  # payout proceeds
+        s = solvent(c)
+        assert s["total_paid_out"] > REWARD + BOND  # contractor also receives the forfeited dispute bond
+        assert c.get_stats()["total_released"] == REWARD and s["fees_retained"] == FEE
+
+    def test_deleted_branch_does_not_overturn(self, world):
+        c, vm, alice, bob, _ = world
+        verified(world)
+        mock_github(vm, compare_http=404, on_branch=False)  # compare against the deleted branch 404s
+        out = dispute(c, vm, alice, reason="deleted the branch")
+        assert out["dispute_outcome"] == "UPHELD_DELIVERY"
+        assert c.get_milestone(1)["status"] == "RELEASED"
+
+    def test_rerun_of_the_check_cannot_overturn_because_the_dispute_is_pinned(self, world):
+        c, vm, alice, bob, _ = world
+        verified(world)
+        assert c.get_milestone(1)["check_run_id"] == 101
+        newer_failure = {"id": 202, "name": CHECK, "app": {"id": 15368}, "status": "completed", "conclusion": "failure",
+                         "output": {"title": "", "summary": "3 passed, 9 failed. Branch coverage: 10%. Critical issues: 4"}}
+        mock_github(vm, decoys=[newer_failure], report=None)  # genuine run 101 still present and green
+        out = dispute(c, vm, alice, reason="re-ran CI and it failed")
+        assert out["dispute_outcome"] == "UPHELD_DELIVERY"
+        assert c.get_milestone(1)["status"] == "RELEASED"
+
+    def test_pinned_check_run_that_disappears_overturns(self, world):
+        c, vm, alice, bob, _ = world
+        verified(world)
+        mock_github(vm, run_id=999, report=None)  # a different run id: the pinned evidence is gone
+        out = dispute(c, vm, alice, reason="the attested run no longer exists")
+        assert out["dispute_outcome"] == "DELIVERY_OVERTURNED" and "ci_attestation_missing" in out["failures"]
+
+    def test_deleted_commit_overturns(self, world):
+        c, vm, alice, bob, _ = world
+        verified(world)
+        mock_github(vm, exists=False)
+        out = dispute(c, vm, alice, reason="commit purged")
+        assert out["dispute_outcome"] == "DELIVERY_OVERTURNED" and "commit_not_found" in out["failures"]
+
+    def test_dispute_validators_judge_the_sha_not_the_branch(self, world):
+        c, vm, alice, bob, _ = world
+        verified(world)
+        mock_github(vm)
+        dispute(c, vm, alice)
+        mock_github(vm, on_branch=False)  # honest validators see a rewritten branch
+        assert vm.run_validator() is True  # ...and still agree: it is irrelevant to a dispute
+
+
+# =========== Delivery refs: an unmerged PR is a valid delivery (no merge veto)
+class TestDeliveryRef:
+    @pytest.fixture(autouse=True)
+    def _active(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+
+    def test_unmerged_pr_commit_with_green_ci_passes_when_the_pr_is_the_delivery_ref(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm, compare_status="ahead", pr=7)  # not merged: ahead of main, never "behind"
+        r = deliver(c, vm, bob, ref="pull/7")
+        assert r["passed"] and r["on_ref"] and r["delivery_ref"] == "pull/7"
+        m = c.get_milestone(1)
+        assert m["status"] == "VERIFIED" and m["delivery_ref"] == "pull/7" and m["check_run_id"] == 101
+
+    def test_the_same_commit_fails_against_the_target_branch_alone(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm, compare_status="ahead", pr=7)
+        r = deliver(c, vm, bob, ref="")
+        assert not r["passed"] and r["failures"] == ["commit_not_on_ref"]
+
+    def test_pr_must_target_the_agreed_branch(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm, compare_status="ahead", pr=7, pr_base="other")
+        assert deliver(c, vm, bob, ref="pull/7")["failures"] == ["commit_not_on_ref"]
+
+    def test_commit_must_be_the_pr_head(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm, compare_status="ahead", pr=7, pr_head=OTHER_SHA)
+        assert deliver(c, vm, bob, ref="pull/7")["failures"] == ["commit_not_on_ref"]
+
+    def test_unmerged_pr_still_needs_the_attested_check_run(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm, compare_status="ahead", pr=7, tests=3)
+        r = deliver(c, vm, bob, ref="pull/7")
+        assert not r["passed"] and r["failures"] == ["tests_below_minimum"]
+
+    def test_delivery_branch_in_the_repository(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm)  # compare feature/x...sha -> behind
+        assert deliver(c, vm, bob, ref="feature/x")["passed"]
+        assert c.get_milestone(1)["delivery_ref"] == "feature/x"
+
+    def test_invalid_refs_are_rejected(self, world):
+        c, vm, _, bob, _ = world
+        mock_github(vm)
+        for bad in ("a..b", "has space", "x" * 101, "refs/heads/a;rm"):
+            with vm.expect_revert("delivery_ref"):
+                deliver(c, vm, bob, ref=bad)
+
+    def test_pr_delivery_survives_a_later_dispute_with_branch_rewrites(self, world):
+        c, vm, alice, bob, _ = world
+        mock_github(vm, compare_status="ahead", pr=7)
+        deliver(c, vm, bob, ref="pull/7")
+        mock_github(vm, compare_status="diverged")  # no PR mock any more: irrelevant for disputes
+        out = dispute(c, vm, alice, reason="closed the PR and rewrote main")
+        assert out["dispute_outcome"] == "UPHELD_DELIVERY"
+
+
+# ================== FROZEN_EXTERNAL_FAULT can never become a permanent deadlock
+class TestFrozenNeverDeadlocks:
+    def exhaust_then_freeze(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        mock_github(vm, tests=1)
+        for _ in range(5):
+            deliver(c, vm, bob)
+        assert c.get_milestone(1)["attempts"] == 5
+        mock_github(vm, repo_state="private")
+        vm.warp(iso(T0 + 8 * DAY))  # deadline passed too; the contractor cannot submit (attempts spent)
+        as_(vm, alice)
+        assert c.claim_default(1)["outcome"] == "FROZEN_EXTERNAL_FAULT"
+
+    def test_exhausted_attempts_then_private_then_public_thaw(self, world):
+        c, vm, alice, bob, charlie = world
+        self.exhaust_then_freeze(world)
+        m = c.get_milestone(1)
+        assert m["status"] == "FROZEN_EXTERNAL_FAULT" and m["attempts"] == 5
+        mock_github(vm)  # the repository is public again
+        as_(vm, charlie)
+        out = c.thaw_milestone(1)  # anyone may thaw
+        assert out["outcome"] == "PENDING"
+        m = c.get_milestone(1)
+        assert m["status"] == "PENDING" and m["attempts"] == 4  # at least one fresh attempt
+        assert m["deadline"] == T0 + 8 * DAY + 72 * HOUR
+        assert deliver(c, vm, bob)["passed"]
+        as_(vm, alice)
+        c.approve_milestone(1)
+        assert c.get_milestone(1)["status"] == "RELEASED"
+        solvent(c)
+
+    def test_exhausted_attempts_then_public_then_evaluate_revives_directly(self, world):
+        c, vm, alice, bob, _ = world
+        self.exhaust_then_freeze(world)
+        mock_github(vm)
+        r = deliver(c, vm, bob)  # evaluate on a frozen milestone bypasses the spent attempt cap
+        assert r["passed"]
+        assert c.get_milestone(1)["status"] == "VERIFIED"
+
+    def test_unilateral_cancel_after_cooldown_even_though_the_repo_is_back(self, world):
+        c, vm, alice, bob, _ = world
+        self.exhaust_then_freeze(world)
+        as_(vm, alice)
+        assert c.cancel_fault_free(1)["outcome"] == "CONSENT_RECORDED"  # frozen < 7 days
+        vm.warp(iso(T0 + 8 * DAY + 7 * DAY + 1))
+        mock_github(vm)  # temporarily reachable again, but the milestone cannot progress by itself
+        assert c.cancel_fault_free(1)["outcome"] == "CANCELLED_FAULT_FREE"
+        s = solvent(c)
+        assert s["total_paid_out"] == REWARD + BOND and s["liabilities"] == 0
+        assert c.get_stats()["total_slashed"] == 0
+
+    def test_cancel_refused_while_progress_is_still_possible(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        mock_github(vm, repo_state="gone")
+        deliver(c, vm, bob)  # frozen at T0, 0 attempts used, deadline T0+7d
+        vm.warp(iso(T0 + 7 * DAY))  # cooldown elapsed, deadline not yet passed
+        mock_github(vm)
+        as_(vm, alice)
+        with vm.expect_revert("thaw_milestone"):
+            c.cancel_fault_free(1)
+        c.thaw_milestone(1)
+        assert c.get_milestone(1)["status"] == "PENDING"
+
+    def test_deadline_elapsed_unlocks_the_unilateral_cancel(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        mock_github(vm, repo_state="gone")
+        deliver(c, vm, bob)
+        vm.warp(iso(T0 + 7 * DAY + 1))  # cooldown AND deadline elapsed
+        mock_github(vm)
+        as_(vm, bob)
+        assert c.cancel_fault_free(1)["outcome"] == "CANCELLED_FAULT_FREE"
+
+    def test_thaw_requires_a_reachable_repo_and_a_frozen_milestone(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        as_(vm, alice)
+        with vm.expect_revert("not frozen"):
+            c.thaw_milestone(1)
+        mock_github(vm, repo_state="gone")
+        deliver(c, vm, bob)
+        with vm.expect_revert("still unreachable"):
+            c.thaw_milestone(1)
+
+    def test_access_blocked_403_is_a_definitive_fault_not_a_forever_retry(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        vm.clear_mocks()
+        vm.mock_web(rf"repositories/{REPO_ID}$", {"status": 403, "body": json.dumps({"message": "Repository access blocked"})})
+        vm.warp(iso(T0 + 8 * DAY))
+        as_(vm, alice)
+        assert c.claim_default(1)["outcome"] == "FROZEN_EXTERNAL_FAULT"
+
+    def test_rate_limit_403_stays_transient(self, world):
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        vm.clear_mocks()
+        vm.mock_web(r".*", {"status": 403, "body": json.dumps({"message": "API rate limit exceeded for 1.2.3.4"})})
+        vm.warp(iso(T0 + 8 * DAY))
+        as_(vm, alice)
+        with vm.expect_revert("[TRANSIENT]"):
+            c.claim_default(1)
+
+    def test_every_non_terminal_state_has_a_terminal_exit(self, world):
+        """Walk the milestone through its awkward states and always reach a terminal state."""
+        c, vm, alice, bob, _ = world
+        active_escrow(c, vm, alice, bob)
+        mock_github(vm, repo_state="gone")
+        deliver(c, vm, bob)                       # FROZEN
+        vm.warp(iso(T0 + 8 * DAY))
+        mock_github(vm)
+        c.thaw_milestone(1)                       # PENDING, deadline now T0+8d+72h
+        vm.warp(iso(T0 + 8 * DAY + 72 * HOUR + 1))
+        as_(vm, alice)
+        assert c.claim_default(1)["outcome"] == "DEFAULTED"  # silent contractor: slash
+        assert c.get_milestone(1)["status"] == "DEFAULTED"
+        assert solvent(c)["liabilities"] == 0

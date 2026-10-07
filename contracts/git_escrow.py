@@ -16,12 +16,14 @@
 #      |  |                                  +--file_dispute (escalating bond + non-refundable fee)
 #      |  +--overturned: deadline >= now+72h,    upheld    -> RELEASED, bond to contractor
 #      |     attempts reset, no default                      overturned -> PENDING
+#      |  (a dispute re-checks the delivered SHA and its PINNED check-run, never the branch tip)
 #      |
 #      +--deadline + resubmit grace pass--> DEFAULTED   (employer: refund + slashed bond)
 #      |
 #      +--repository deleted / private / inaccessible--> FROZEN_EXTERNAL_FAULT
-#             +--evaluate succeeds again (repo recovered)--> PENDING (deadline extended)
-#             +--cancel_fault_free (both consent, or 7 days + repo still gone)
+#             +--thaw_milestone / evaluate once the repo answers--> PENDING (deadline extended,
+#             |                                                    at least one fresh attempt)
+#             +--cancel_fault_free (both consent, or 7 days + repo gone / attempts spent / deadline passed)
 #                  --> CANCELLED_FAULT_FREE: employer refunded, bond returned intact
 #
 # The repository is bound by its numeric GitHub id when the contractor accepts,
@@ -100,6 +102,7 @@ GITHUB_HEADERS = {
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+REF_RE = re.compile(r"^(pull/[0-9]{1,9}|[A-Za-z0-9_./-]{1,100})$")  # branch name or PR head (pull/N)
 
 SPOOFED_REPORT = "SPOOFED_REPORT_PAYLOAD"
 
@@ -159,8 +162,11 @@ def _parse_ci_text(text: str) -> dict:
     return out
 
 
-def _select_attested_run(payload, check_name: str, app_id: int):
-    """The newest check-run with this exact name created by this exact GitHub App id."""
+def _select_attested_run(payload, check_name: str, app_id: int, pin_run_id: int = 0):
+    """The newest check-run with this exact name from this exact GitHub App id.
+
+    With `pin_run_id` only that very run qualifies: disputes re-judge the evidence the delivery
+    was accepted on, so a later re-run of the check cannot change the outcome."""
     runs = payload.get("check_runs") if isinstance(payload, dict) else None
     if not isinstance(runs, list):
         return None
@@ -173,6 +179,8 @@ def _select_attested_run(payload, check_name: str, app_id: int):
         if _as_int(app.get("id"), -1) != app_id:
             continue
         run_id = _as_int(run.get("id"), 0)
+        if pin_run_id and run_id != pin_run_id:
+            continue
         if best is None or run_id > best_id:
             best, best_id = run, run_id
     return best
@@ -233,8 +241,8 @@ def _judge(ev: dict, min_tests: int, min_coverage_bps: int):
         failures.append("commit_not_found")
     elif not ev["repo_match"]:
         failures.append("spoofed_payload")
-    elif not ev["on_branch"]:
-        failures.append("commit_not_on_branch")
+    elif not ev["on_ref"]:
+        failures.append("commit_not_on_ref")
     if ev["commit_exists"]:
         if ev["report_mismatch"]:
             failures.append(SPOOFED_REPORT)
@@ -271,6 +279,13 @@ def _header(res, name: str) -> str:
     return ""
 
 
+def _is_rate_limited(res) -> bool:
+    if _header(res, "x-ratelimit-remaining") == "0" or _header(res, "retry-after") != "":
+        return True
+    body = _to_text(res.body).lower()
+    return "rate limit" in body or "abuse" in body or "secondary" in body
+
+
 def _http_get(url: str):
     """GET with (bounded) redirect following and transient/external error classification."""
     target = url
@@ -283,6 +298,8 @@ def _http_get(url: str):
                 target = location
                 continue
             raise gl.vm.UserError(f"{ERROR_TRANSIENT} unresolved redirect {status}")
+        if status == 403 and not _is_rate_limited(res):
+            return status, _to_text(res.body)  # access blocked / disabled repository: a definitive answer
         if status == 429 or status == 403 or status >= 500:
             raise gl.vm.UserError(f"{ERROR_TRANSIENT} upstream status {status}")
         if status == 401:
@@ -294,7 +311,7 @@ def _http_get(url: str):
 def _fetch_repo(url: str) -> dict:
     """Repository identity and availability. Deleted, private or blocked == unavailable."""
     status, text = _http_get(url)
-    if status in (404, 410, 451):
+    if status in (403, 404, 410, 451):
         return {"available": False, "id": 0, "full_name": ""}
     if status != 200:
         raise gl.vm.UserError(f"{ERROR_EXTERNAL} unexpected repository status {status}")
@@ -309,16 +326,50 @@ def _fetch_repo(url: str) -> dict:
     }
 
 
-def _collect_evidence(repo_id: int, repo_name: str, check_name: str, app_id: int, branch: str, sha: str,
+def _ref_contains(base: str, branch: str, delivery_ref: str, sha: str) -> bool:
+    """Is the delivered commit part of the agreed delivery ref?
+
+    * "" (default): the target branch's history, via the compare API.
+    * "pull/N": the head commit of pull request N, which must target the agreed branch. The
+      employer cannot veto delivery by refusing to merge, and cannot rewrite a PR head.
+    * any other branch name in the repository: the commit is in that branch's history.
+    """
+    if delivery_ref.startswith("pull/"):
+        status, text = _http_get(f"{base}/pulls/{delivery_ref[5:]}")
+        if status != 200:
+            return False
+        data = _safe_json(text)
+        if not isinstance(data, dict):
+            return False
+        head = data.get("head") if isinstance(data.get("head"), dict) else {}
+        target = data.get("base") if isinstance(data.get("base"), dict) else {}
+        return str(head.get("sha", "")).lower() == sha and target.get("ref") == branch
+    ref = delivery_ref if delivery_ref != "" else branch
+    status, text = _http_get(f"{base}/compare/{quote(ref, safe='/')}...{sha}")
+    if status != 200:
+        return False
+    data = _safe_json(text)
+    return isinstance(data, dict) and data.get("status") in ("identical", "behind")
+
+
+def _collect_evidence(repo_id: int, repo_name: str, check_name: str, app_id: int, branch: str,
+                      delivery_ref: str, pin_run_id: int, recheck: bool, sha: str,
                       min_tests: int, min_coverage_bps: int) -> dict:
-    """Fetch and judge the delivery. Runs independently on every validator."""
+    """Fetch and judge the delivery. Runs independently on every validator.
+
+    recheck=True (disputes) judges the delivered SHA itself: ref containment is not re-evaluated
+    (a rewritten or deleted branch tip must not overturn a valid delivery) and the check-run is
+    the pinned run the delivery was accepted on.
+    """
     ev = {
         "repo_id": repo_id,
         "repo_available": False,
         "commit_exists": False,
         "repo_match": False,
-        "on_branch": False,
+        "on_ref": False,
+        "ref_checked": not recheck,
         "ci_state": "none",
+        "check_run_id": 0,
         "tests_passed": 0,
         "tests_failed": 0,
         "coverage_bps": 0,
@@ -352,20 +403,21 @@ def _collect_evidence(repo_id: int, repo_name: str, check_name: str, app_id: int
         raise gl.vm.UserError(f"{ERROR_EXTERNAL} unexpected commit status {status}")
 
     if ev["commit_exists"]:
-        # 2. Branch containment: ancestor of (or equal to) the branch tip.
-        status, text = _http_get(f"{base}/compare/{quote(branch, safe='/')}...{sha}")
-        if status == 200:
-            data = _safe_json(text)
-            if isinstance(data, dict):
-                ev["on_branch"] = data.get("status") in ("identical", "behind")
+        # 2. Delivery-ref containment (skipped on dispute re-checks: the SHA is what was delivered).
+        if recheck:
+            ev["on_ref"] = True
+        else:
+            ev["on_ref"] = _ref_contains(base, branch, delivery_ref, sha)
 
         # 3. The attested check-run: exact name + exact GitHub App id, bound to this commit.
         status, text = _http_get(f"{base}/commits/{sha}/check-runs?per_page=100")
-        attested = _attested_metrics(None)
+        run = None
         if status == 200:
-            attested = _attested_metrics(_select_attested_run(_safe_json(text), check_name, app_id))
+            run = _select_attested_run(_safe_json(text), check_name, app_id, pin_run_id)
+        attested = _attested_metrics(run)
         ev["ci_state"] = attested["state"]
-        if attested["state"] != "none":
+        if run is not None:
+            ev["check_run_id"] = _as_int(run.get("id"), 0)
             ev["report_source"] = "check_run"
         if attested["passed"] is not None:
             ev["tests_passed"] = attested["passed"]
@@ -391,7 +443,7 @@ def _collect_evidence(repo_id: int, repo_name: str, check_name: str, app_id: int
 def _reports_agree(leader, mine) -> bool:
     if not isinstance(leader, dict) or not isinstance(mine, dict):
         return False
-    keys = ("passed", "failures", "repo_available", "commit_exists", "on_branch", "ci_state",
+    keys = ("passed", "failures", "repo_available", "commit_exists", "on_ref", "ci_state", "check_run_id",
             "tests_passed", "tests_failed", "coverage_bps", "critical_findings", "report_mismatch")
     for key in keys:
         if leader.get(key) != mine.get(key):
@@ -449,6 +501,8 @@ class Milestone:
     deadline: u256
     status: str
     submitted_sha: str
+    delivery_ref: str
+    check_run_id: u256
     attempts: u256
     pending_polls: u256
     verified_at: u256
@@ -553,17 +607,19 @@ class GitEscrow(gl.contract.Contract):
         self._close_milestone(e)
         self._pay(e.contractor, reward + bond + extra_to_contractor)
 
-    def _verify(self, e: Escrow, m: Milestone, sha: str) -> dict:
+    def _verify(self, e: Escrow, m: Milestone, sha: str, delivery_ref: str, recheck: bool) -> dict:
         repo_id = int(e.repo_id)
         repo_name = e.repo
         branch = e.branch
         check_name = m.check_name
         app_id = int(m.app_id)
+        pin = int(m.check_run_id) if recheck else 0
         min_tests = int(m.min_tests)
         min_cov = int(m.min_coverage_bps)
 
         def leader_fn():
-            return _collect_evidence(repo_id, repo_name, check_name, app_id, branch, sha, min_tests, min_cov)
+            return _collect_evidence(repo_id, repo_name, check_name, app_id, branch, delivery_ref, pin,
+                                     recheck, sha, min_tests, min_cov)
 
         return gl.vm.run_nondet(leader_fn, _make_validator(leader_fn, _reports_agree))
 
@@ -674,6 +730,8 @@ class GitEscrow(gl.contract.Contract):
                 deadline=u256(p[8]),
                 status=MS_PENDING,
                 submitted_sha="",
+                delivery_ref="",
+                check_run_id=u256(0),
                 attempts=u256(0),
                 pending_polls=u256(0),
                 verified_at=u256(0),
@@ -744,8 +802,13 @@ class GitEscrow(gl.contract.Contract):
 
     # --------------------------------------------------------------- delivery
     @gl.public.write
-    def evaluate_milestone_delivery(self, milestone_id: u256, commit_sha: str) -> dict:
+    def evaluate_milestone_delivery(self, milestone_id: u256, commit_sha: str, delivery_ref: str) -> dict:
         """Contractor submits a commit; the validator quorum verifies it on GitHub.
+
+        `delivery_ref` names where the commit lives: "" = the target branch, "pull/N" = the head of
+        pull request N (which must target the agreed branch), or any branch of the repository.
+        An unmerged PR with a green attested check-run is a valid delivery, so the employer
+        cannot veto payment by declining to merge.
 
         A failing verdict is recorded (not reverted) so the failure reasons persist and the
         contractor may fix and resubmit. Attempts are conserved when the verdict only says
@@ -765,16 +828,20 @@ class GitEscrow(gl.contract.Contract):
         now = self._now()
         if not was_frozen and now > int(m.deadline):
             self._fail("milestone deadline expired")
-        if int(m.attempts) >= MAX_ATTEMPTS:
+        if not was_frozen and int(m.attempts) >= MAX_ATTEMPTS:
             self._fail("maximum delivery attempts reached")
+        ref = delivery_ref.strip()
+        if ref != "" and (not REF_RE.match(ref) or ".." in ref):
+            self._fail("delivery_ref must be empty, a branch name, or pull/N")
         sha = commit_sha.strip().lower()
         if not SHA_RE.match(sha):
             self._fail("commit_sha must be a full 40-hex commit")
         if m.expected_sha != "" and sha != m.expected_sha:
             self._fail("commit does not match the contract's expected_sha")
 
-        report = self._verify(e, m, sha)
+        report = self._verify(e, m, sha, ref, False)
         report["sha"] = sha
+        report["delivery_ref"] = ref
         report["evaluated_at"] = now
 
         if not report["repo_available"]:
@@ -791,9 +858,11 @@ class GitEscrow(gl.contract.Contract):
             m.status = MS_PENDING
             m.frozen_at = u256(0)
             m.consent_mask = u256(0)
+            m.attempts = u256(min(int(m.attempts), MAX_ATTEMPTS - 1))  # a revived milestone is never a dead end
             self._extend_for_resubmit(m, now)
 
         m.submitted_sha = sha
+        m.delivery_ref = ref
         only_pending = report["failures"] == ["ci_pending"]
         if only_pending and int(m.pending_polls) < MAX_PENDING_POLLS:
             m.pending_polls += 1
@@ -801,6 +870,7 @@ class GitEscrow(gl.contract.Contract):
             m.attempts += 1
         self._record(m, report)
         if report["passed"]:
+            m.check_run_id = u256(int(report["check_run_id"]))  # dispute re-checks stay pinned to this run
             m.status = MS_VERIFIED
             m.verified_at = u256(now)
             m.release_at = u256(now + DISPUTE_WINDOW)
@@ -862,11 +932,33 @@ class GitEscrow(gl.contract.Contract):
         return {"outcome": MS_DEFAULTED}
 
     @gl.public.write
+    def thaw_milestone(self, milestone_id: u256) -> dict:
+        """Anyone revives a frozen milestone once a quorum sees the repository again.
+
+        The contractor gets a fresh window (deadline >= now + 72h) and at least one fresh attempt.
+        """
+        m = self._milestone(int(milestone_id))
+        e = self.escrows[m.escrow_id]
+        if m.status != MS_FROZEN:
+            self._fail("milestone is not frozen by an external fault")
+        if not self._repo_reachable(e):
+            self._fail("repository is still unreachable")
+        now = self._now()
+        m.status = MS_PENDING
+        m.frozen_at = u256(0)
+        m.consent_mask = u256(0)
+        m.attempts = u256(min(int(m.attempts), MAX_ATTEMPTS - 1))
+        self._extend_for_resubmit(m, now)
+        return {"outcome": MS_PENDING, "deadline": int(m.deadline)}
+
+    @gl.public.write
     def cancel_fault_free(self, milestone_id: u256) -> dict:
         """Neutral exit for a frozen milestone: employer refunded, contractor bond returned intact.
 
-        Needs both parties' consent, or FREEZE_GRACE of freeze plus a fresh quorum
-        confirmation that the repository is still unreachable.
+        Needs both parties' consent, or FREEZE_GRACE of freeze plus either a fresh quorum
+        confirmation that the repository is still unreachable, or proof the milestone cannot make
+        progress on its own (attempts exhausted or deadline elapsed). This is the guaranteed
+        terminal path: a frozen milestone can never be deadlocked.
         """
         m = self._milestone(int(milestone_id))
         e = self.escrows[m.escrow_id]
@@ -885,8 +977,9 @@ class GitEscrow(gl.contract.Contract):
         if mask != 3:
             if self._now() < int(m.frozen_at) + FREEZE_GRACE:
                 return {"outcome": "CONSENT_RECORDED", "consent_mask": mask}
-            if self._repo_reachable(e):
-                self._fail("repository is reachable again; resubmit through evaluate_milestone_delivery")
+            exhausted = int(m.attempts) >= MAX_ATTEMPTS or self._now() > int(m.deadline)
+            if not exhausted and self._repo_reachable(e):
+                self._fail("repository is reachable again; thaw_milestone or resubmit instead")
 
         reward = int(m.reward)
         bond = int(m.bond)
@@ -902,7 +995,9 @@ class GitEscrow(gl.contract.Contract):
         """Employer challenges a verified milestone inside the 48h window.
 
         Cost = escalating refundable bond + non-refundable fee (3% of reward, retained
-        by the contract). A fresh quorum re-verifies the same commit:
+        by the contract). A fresh quorum re-judges the DELIVERED COMMIT ITSELF: it must still exist,
+        belong to the repository, and its pinned check-run must still verify. The branch tip is not
+        re-evaluated, so rewriting or deleting the branch after delivery cannot overturn it:
           * upheld     -> bond is forfeited to the contractor, milestone releases now
           * overturned -> bond refunded, milestone returns to PENDING and the contractor gets
                           a fresh 72h delivery window (deadline = max(deadline, now + 72h))
@@ -929,7 +1024,7 @@ class GitEscrow(gl.contract.Contract):
         if paid != bond + fee:
             self._fail(f"dispute cost must be exactly {bond + fee} (bond {bond} + non-refundable fee {fee})")
 
-        report = self._verify(e, m, m.submitted_sha)
+        report = self._verify(e, m, m.submitted_sha, m.delivery_ref, True)
         if not report["repo_available"]:
             self._fail("repository is unreachable; a dispute cannot be decided")
         if report["failures"] == ["ci_pending"]:
@@ -979,6 +1074,8 @@ class GitEscrow(gl.contract.Contract):
             "deadline": int(m.deadline),
             "status": m.status,
             "submitted_sha": m.submitted_sha,
+            "delivery_ref": m.delivery_ref,
+            "check_run_id": int(m.check_run_id),
             "attempts": int(m.attempts),
             "pending_polls": int(m.pending_polls),
             "verified_at": int(m.verified_at),

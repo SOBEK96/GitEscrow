@@ -36,13 +36,14 @@ export function MilestoneProgress({ escrow, selectedId, onSelect }: { escrow: Es
 export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow: Escrow; m: Milestone; actorAddress: string; onOutcome(o: Outcome): void }) {
   const { backend, run, notify, busy, snap } = useBackend();
   const [sha, setSha] = useState("");
+  const [ref, setRef] = useState("");
   const isContractor = actorAddress.toLowerCase() === escrow.contractor.toLowerCase();
   const expired = snap.now > m.deadline;
   const frozen = m.status === "FROZEN_EXTERNAL_FAULT";
   const canDeliver = escrow.status === "ACTIVE" && (m.status === "PENDING" || frozen) && isContractor && (frozen || !expired) && m.attempts < MAX_ATTEMPTS;
 
   async function deliver() {
-    const out = await run(() => backend.evaluate(actorAddress, m.id, sha || m.expectedSha));
+    const out = await run(() => backend.evaluate(actorAddress, m.id, sha || m.expectedSha, ref.trim()));
     if (!out) return;
     onOutcome(out);
     notify(out.report.passed ? "ok" : "err", out.report.passed ? "Consensus verified the delivery — dispute window opened" : "Consensus rejected the delivery — see telemetry");
@@ -61,7 +62,7 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
         <Criterion label="Attested check-run" value={`${m.checkName} · app ${m.appId}`} />
         <Criterion label="Deadline" value={fmtDate(m.deadline)} tone={expired && m.status === "PENDING" && snap.now > m.resubmitUntil ? "bad" : undefined} />
         <Criterion label="Attempts" value={`${m.attempts} / ${MAX_ATTEMPTS}${m.pendingPolls ? ` · ${m.pendingPolls} CI polls` : ""}`} />
-        <Criterion label="Submitted" value={m.submittedSha ? shortSha(m.submittedSha) : "—"} />
+        <Criterion label="Submitted" value={m.submittedSha ? `${shortSha(m.submittedSha)}${m.deliveryRef ? ` @ ${m.deliveryRef}` : ""}` : "—"} />
       </div>
 
       {(m.status === "PENDING" || frozen) && (
@@ -72,6 +73,8 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
               placeholder={m.expectedSha || "full 40-character commit SHA"} aria-label="Commit SHA" />
             <button className="btn-primary whitespace-nowrap" disabled={!canDeliver || busy} onClick={deliver}><Play size={14} /> Verify on-chain</button>
           </div>
+          <input className="input mt-2 font-mono text-xs" value={ref} onChange={(e) => setRef(e.target.value)} disabled={!canDeliver}
+            placeholder="delivery ref (optional): empty = target branch · pull/7 = unmerged PR head · feature/x" aria-label="Delivery ref" />
           {!isContractor && <p className="mt-2 text-xs text-zinc-500">Only the contractor can submit a commit. Switch persona to submit.</p>}
           {isContractor && escrow.status !== "ACTIVE" && <p className="mt-2 text-xs text-warn">Post the performance bond first to activate this escrow.</p>}
           {expired && m.status === "PENDING" && snap.now <= m.resubmitUntil && <p className="mt-2 text-xs text-warn">Resubmit grace window: the deadline was extended after an overturned delivery.</p>}

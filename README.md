@@ -291,7 +291,11 @@ npm run dev            # http://localhost:3000
 npm test               # TypeScript copy of the bond / dispute rules, pinned to the Python numbers
 ```
 
-The dashboard is live-only: it reads and writes the contract deployed on Studio Next (address in `frontend/lib/config.ts`) through `genlayer-js`, signing with a browser-held test key (the `Fund` button uses the Studio faucet RPC). `scripts/deploy.py` keeps `CONTRACT_ADDRESS` in sync.
+The dashboard is live-only: it reads and writes the contract on Studio Next (address in `frontend/lib/config.ts`) through `genlayer-js`.
+
+* **Connect Wallet** uses any injected EIP-1193 wallet (`window.ethereum`, e.g. MetaMask). It requests your account, then adds or switches to *GenLayer Studio Next* (chain id `61997` / `0xf22d`, symbol `GEN`, RPC `https://studio-next.genlayer.com/api`) and signs every transaction in the wallet. A "Switch to Studio Next" button appears if the wallet drifts to another chain. Disconnect returns to the logged-out state.
+* **Demo / Quick Test** (only offered when no wallet extension is installed) generates a throwaway key that lives in this browser only.
+* **Fund** credits 1000 GEN from the Studio faucet to the connected address. The faucet (`sim_fundAccount`) needs a positive *integer* wei amount and keys balances by exact address casing, so the amount is sent as a BigInt-derived decimal string and the address is EIP-55 checksummed first. Studio rate-limits an IP to 30 RPC requests per minute; the dashboard polls every 45s and backs off automatically on `-32029`.
 
 Panels: escrow explorer + creator (repo, branch, milestones, thresholds, bond slider, deadline pickers), TVL / dual-staking / solvency strip, milestone progress bar and submission card, live consensus telemetry (per-check results, validator votes), and the dispute & settlement terminal (countdown, claim settlement, default claim, escalating bond ladder).
 

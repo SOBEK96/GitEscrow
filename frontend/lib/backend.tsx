@@ -2,6 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { LiveBackend } from "./live";
+import { friendlyError } from "./wallet";
 import type { Escrow, Solvency, Stats } from "./types";
 
 export interface Snapshot {
@@ -46,7 +47,7 @@ export function BackendProvider({ children }: { children: React.ReactNode }) {
       const [escrows, stats, solvency] = await Promise.all([backend.listEscrows(), backend.stats(), backend.solvency()]);
       setSnap({ escrows, stats, solvency, now: backend.now(), loading: false, error: null });
     } catch (e) {
-      setSnap((s) => ({ ...s, loading: false, error: e instanceof Error ? e.message : String(e) }));
+      setSnap((s) => ({ ...s, loading: false, error: friendlyError(e) }));
     }
   }, [backend]);
 
@@ -54,7 +55,7 @@ export function BackendProvider({ children }: { children: React.ReactNode }) {
     refresh();
     const unsub = backend.subscribe(refresh);
     const tick = setInterval(() => setSnap((s) => ({ ...s, now: backend.now() })), 1000);
-    const poll = setInterval(refresh, 15000);
+    const poll = setInterval(refresh, 45000); // Studio allows 30 RPC requests/minute per client
     return () => { unsub(); clearInterval(tick); clearInterval(poll); };
   }, [backend, refresh]);
 
@@ -65,7 +66,7 @@ export function BackendProvider({ children }: { children: React.ReactNode }) {
       await refresh();
       return out;
     } catch (e) {
-      notify("err", (e instanceof Error ? e.message : String(e)).replace(/^.*?\[EXPECTED\]\s*/, ""));
+      notify("err", friendlyError(e));
       return undefined;
     } finally {
       setBusy(false);

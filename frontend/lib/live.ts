@@ -10,7 +10,10 @@ import type {
   Stats, ValidatorVote,
 } from "./types";
 
+import { getAddress } from "viem";
 import { CONTRACT_ADDRESS, RPC_URL } from "./config";
+import { parseGen } from "./format";
+import { ensureStudioNetwork, getInjected } from "./wallet";
 
 const KEY_STORAGE = "gitescrow.burner.key";
 
@@ -82,70 +85,238 @@ function traceFromReceipt(tx: Any, report: Report): ConsensusTrace {
   };
 }
 
+/** Best-effort extraction of the contract's revert text from a decided receipt. */
+function revertReason(tx: Any): string {
+  const seen = new Set<unknown>();
+  const found: string[] = [];
+  const walk = (node: Any, depth: number) => {
+    if (!node || typeof node !== "object" || seen.has(node) || depth > 8) return;
+    seen.add(node);
+    for (const [k, v] of Object.entries(node)) {
+      if (typeof v === "string" && /^(stderr|message|error|raw_error|error_description)$/i.test(k) && /\[(EXPECTED|EXTERNAL|TRANSIENT)\]|UserError|Error/.test(v)) found.push(v);
+      else walk(v, depth + 1);
+    }
+  };
+  walk(tx, 0);
+  const text = found.find((f) => /\[(EXPECTED|EXTERNAL|TRANSIENT)\]/.test(f)) ?? found[0] ?? "";
+  return text.replace(/\s+/g, " ").slice(0, 240);
+}
+
+/** Studio answers -32029 when a client exceeds 30 requests/minute; wait the advertised time and retry. */
+async function withBackoff<T>(fn: () => Promise<T>, attempts = 4): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const err = e as Any;
+      const cause = err?.cause ?? err;
+      const limited = cause?.code === -32029 || /rate limit exceeded/i.test(String(cause?.message ?? err?.message ?? ""));
+      if (!limited || i + 1 >= attempts) throw e;
+      const wait = Number(cause?.data?.retry_after_seconds ?? 10);
+      await new Promise((r) => setTimeout(r, (Math.min(wait, 30) + 1) * 1000));
+    }
+  }
+}
+
+export type WalletKind = "injected" | "burner";
+export interface Identity { kind: WalletKind; address: string }
+
+const MODE_STORAGE = "gitescrow.wallet";
+
+function store(key: string, value: string | null) {
+  try { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch { /* storage may be blocked */ }
+}
+function load(key: string): string | null {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
 export class LiveBackend implements Backend {
   label = "Studio Next";
   private listeners = new Set<() => void>();
-  private clientP: Promise<{ client: Any; account: Any }> | null = null;
-  private addr = "";
+  private identity: Identity | null = null;
+  private readers = new Map<string, Promise<Any>>();
+  private restored: Promise<void> | null = null;
+  private providerBound = false;
+  private burnerKey: string | null = null; // held in memory so signing never depends on localStorage being readable
 
   constructor(private readonly contract: string = CONTRACT_ADDRESS) {}
 
-  private async ctx() {
-    if (!this.clientP) {
-      this.clientP = (async () => {
-        const sdk: Any = await import("genlayer-js");
-        const { generatePrivateKey, createAccount, createClient, chains } = sdk;
-        let key: string | null = null;
-        try { key = localStorage.getItem(KEY_STORAGE); } catch { /* storage may be blocked */ }
-        if (!key) {
-          key = generatePrivateKey();
-          try { localStorage.setItem(KEY_STORAGE, key as string); } catch { /* ignore */ }
+  // ------------------------------------------------------------ identity
+  /** Silent session restore: re-attach an already-authorised wallet (no popup) or the demo key. */
+  init(): Promise<void> {
+    if (!this.restored) {
+      this.restored = (async () => {
+        const mode = load(MODE_STORAGE);
+        const injected = getInjected();
+        if (mode === "injected" && injected) {
+          try {
+            const accounts = (await injected.request({ method: "eth_accounts" })) as string[];
+            if (accounts?.[0]) this.identity = { kind: "injected", address: getAddress(accounts[0]) };
+          } catch { /* wallet locked or unavailable: stay disconnected */ }
+        } else if (mode === "burner") {
+          await this.useDemoKey(false);
         }
-        const account = createAccount(key);
-        const client = createClient({ chain: chains.studioDevnet, endpoint: RPC_URL, account });
-        this.addr = account.address;
-        return { client, account };
+        this.bindProviderEvents();
       })();
     }
-    return this.clientP;
+    return this.restored;
   }
 
-  /** Resolve the burner address (also primes the client). */
-  async init(): Promise<string> { await this.ctx(); return this.addr; }
+  hasExtension(): boolean { return getInjected() !== null; }
+  getIdentity(): Identity | null { return this.identity; }
 
-  async importKey(privateKey: string) {
-    try { localStorage.setItem(KEY_STORAGE, privateKey); } catch { /* ignore */ }
-    this.clientP = null;
-    await this.init();
+  private bindProviderEvents() {
+    const provider = getInjected();
+    if (!provider?.on || this.providerBound) return;
+    this.providerBound = true;
+    provider.on("accountsChanged", (accounts) => {
+      const list = accounts as string[];
+      if (this.identity?.kind !== "injected") return;
+      this.identity = list?.[0] ? { kind: "injected", address: getAddress(list[0]) } : null;
+      if (!this.identity) store(MODE_STORAGE, null);
+      this.emit();
+    });
+    provider.on("chainChanged", () => this.emit());
+  }
+
+  /** Real wallet: prompt for accounts, then add / switch to Studio Next. */
+  async connectWallet(): Promise<string> {
+    const provider = getInjected();
+    if (!provider) throw new Error("No browser wallet found. Install MetaMask, or use the demo key.");
+    const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+    if (!accounts?.[0]) throw new Error("The wallet returned no account.");
+    await ensureStudioNetwork(provider);
+    this.identity = { kind: "injected", address: getAddress(accounts[0]) };
+    store(MODE_STORAGE, "injected");
+    this.bindProviderEvents();
+    this.emit();
+    return this.identity.address;
+  }
+
+  /** Optional quick-test fallback: a throwaway key generated and kept in this browser only. */
+  async useDemoKey(announce = true): Promise<string> {
+    const sdk: Any = await import("genlayer-js");
+    let key = this.burnerKey ?? load(KEY_STORAGE);
+    if (!key) {
+      key = sdk.generatePrivateKey() as string;
+      store(KEY_STORAGE, key);
+    }
+    this.burnerKey = key;
+    this.identity = { kind: "burner", address: getAddress(sdk.createAccount(key).address) };
+    store(MODE_STORAGE, "burner");
+    if (announce) this.emit();
+    return this.identity.address;
+  }
+
+  disconnect() {
+    this.identity = null;
+    store(MODE_STORAGE, null);
     this.emit();
   }
 
-  /** Studio networks expose a faucet-style RPC for test accounts. */
-  async fund(amountGen = 1000): Promise<void> {
-    const { client, account } = await this.ctx();
-    await client.request({ method: "sim_fundAccount", params: [account.address, amountGen * 10 ** 6 * 10 ** 12] });
+  /** Chain id the injected wallet is currently on (null for the demo key / no wallet). */
+  async walletChainId(): Promise<number | null> {
+    const provider = getInjected();
+    if (this.identity?.kind !== "injected" || !provider) return null;
+    try { return parseInt(String(await provider.request({ method: "eth_chainId" })), 16); } catch { return null; }
+  }
+
+  async switchNetwork() {
+    const provider = getInjected();
+    if (!provider) throw new Error("No browser wallet found.");
+    await ensureStudioNetwork(provider);
     this.emit();
   }
 
-  actors(): Actor[] { return [{ id: "me", label: "Browser key", address: this.addr || "…" }]; }
+  private async client(signer: boolean): Promise<Any> {
+    const id = signer ? this.identity : null;
+    if (signer && !id) throw new Error("Connect a wallet first.");
+    const cacheKey = id ? `${id.kind}:${id.address}` : "read";
+    let cached = this.readers.get(cacheKey);
+    if (!cached) {
+      cached = (async () => {
+        const sdk: Any = await import("genlayer-js");
+        const { createAccount, createClient, chains } = sdk;
+        let account: Any;
+        if (id?.kind === "burner") account = createAccount(this.burnerKey);
+        else if (id?.kind === "injected") account = id.address; // address-only: genlayer-js signs through window.ethereum
+        return createClient({ chain: chains.studioDevnet, endpoint: RPC_URL, ...(account ? { account } : {}) });
+      })();
+      this.readers.set(cacheKey, cached);
+    }
+    return cached;
+  }
+
+  /**
+   * Credit the connected address from the Studio faucet.
+   *
+   * `sim_fundAccount` insists on a positive INTEGER amount in wei. Passing a JS number such as
+   * 1000 * 10**18 serialises as `1e+21` and is rejected ("amount must be a positive integer"),
+   * so the amount is parsed to a BigInt and sent as a decimal string. The faucet also keys
+   * balances by exact address casing, and wallets hand out lowercase addresses, so the
+   * address is EIP-55 checksummed first (otherwise the funds land on a different key).
+   */
+  async fund(amountGen: string | number = "1000"): Promise<bigint> {
+    if (!this.identity) throw new Error("Connect a wallet first.");
+    const wei = parseGen(String(amountGen));
+    if (wei <= 0n) throw new Error("Amount must be greater than zero.");
+    const address = getAddress(this.identity.address);
+    const res = await fetch(RPC_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "sim_fundAccount", params: [address, wei.toString()] }),
+    });
+    const body = (await res.json()) as { error?: { message?: string; data?: { retry_after_seconds?: number } }; result?: string };
+    if (body.error) {
+      const retry = body.error.data?.retry_after_seconds;
+      throw new Error(`${body.error.message ?? "Faucet request failed"}${retry ? ` - try again in ${retry}s` : ""}`);
+    }
+    this.emit();
+    return wei;
+  }
+
+  async balance(): Promise<bigint> {
+    if (!this.identity) return 0n;
+    const res = await fetch(RPC_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [getAddress(this.identity.address), "latest"] }),
+    });
+    const body = (await res.json()) as { result?: string };
+    return body.result ? BigInt(body.result) : 0n;
+  }
+
+  actors(): Actor[] {
+    const id = this.identity;
+    return [{ id: "me", label: id?.kind === "burner" ? "Demo key" : "Wallet", address: id?.address ?? "" }];
+  }
   now() { return Math.floor(Date.now() / 1000); }
   subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private emit() { this.listeners.forEach((l) => l()); }
 
   private async read(functionName: string, args: Any[] = []): Promise<Any> {
-    const { client } = await this.ctx();
-    return normalize(await client.readContract({ address: this.contract, functionName, args }));
+    const client = await this.client(false);
+    return normalize(await withBackoff(() => client.readContract({ address: this.contract, functionName, args })));
   }
 
   private async write(functionName: string, args: Any[], value?: bigint): Promise<Any> {
-    const { client } = await this.ctx();
-    const fees = await client.estimateTransactionFees({});
-    const hash = await client.writeContract({ address: this.contract, functionName, args, value, fees });
-    const tx = await client.waitForTransactionReceipt({ hash, waitUntil: "decided", retries: 200, interval: 3000 });
+    const client = await this.client(true);
+    if (this.identity?.kind === "injected") {
+      const provider = getInjected();
+      if (!provider) throw new Error("The browser wallet is no longer available.");
+      await ensureStudioNetwork(provider);
+    }
+    if (value !== undefined && value < 0n) throw new Error("Transaction value must not be negative.");
+    const fees = await withBackoff(() => client.estimateTransactionFees({}));
+    const hash = await withBackoff(() => client.writeContract({ address: this.contract, functionName, args, value, fees }));
+    const tx: Any = await withBackoff(() => client.waitForTransactionReceipt({ hash, waitUntil: "decided", retries: 120, interval: 5000 }));
     const status = Number(tx?.status);
     const name = String(tx?.statusName ?? "");
-    const ok = status === 5 || status === 7 || name === "ACCEPTED" || name === "FINALIZED";
-    if (!ok) throw new Error(`Transaction ${name || status} — consensus did not accept it`);
+    const accepted = status === 5 || status === 7 || name === "ACCEPTED" || name === "FINALIZED";
+    const execution = String(tx?.txExecutionResultName ?? "FINISHED_WITH_RETURN");
+    if (!accepted || execution !== "FINISHED_WITH_RETURN") {
+      throw Object.assign(new Error(`Transaction ${name || status} (${execution}) - ${revertReason(tx) || "consensus did not accept it"}`), { receipt: tx });
+    }
     this.emit();
     return tx;
   }
@@ -223,9 +394,9 @@ export class LiveBackend implements Backend {
   }
 
   async fileDispute(_by: string, milestoneId: number, reason: string): Promise<Outcome> {
-    const { account } = await this.ctx();
+    if (!this.identity) throw new Error("Connect a wallet first.");
     // The contract demands exactly: escalating refundable bond + non-refundable arbitration fee.
-    const cost = (await this.quoteDisputeBond(milestoneId, account.address)) + (await this.quoteDisputeFee(milestoneId));
+    const cost = (await this.quoteDisputeBond(milestoneId, this.identity.address)) + (await this.quoteDisputeFee(milestoneId));
     const tx = await this.write("file_dispute", [BigInt(milestoneId), reason], cost);
     return this.outcome(milestoneId, tx);
   }

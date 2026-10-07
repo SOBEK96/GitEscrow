@@ -1,0 +1,15 @@
+[project]
+name = "git-escrow"
+version = "0.1.0"
+description = "Autonomous, code-verifiable milestone escrow on GenLayer"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "genlayer-test>=0.30.0rc2"]
+
+# Direct-mode suite: in-memory GenVM, no network, ~30ms per test.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["tests"]

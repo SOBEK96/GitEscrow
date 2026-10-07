@@ -1,0 +1,212 @@
+{
+  "address": "0xF461Aef48b527D020715B18966f03c4ABE75Da11",
+  "chainId": 61997,
+  "rpcUrl": "https://studio-next.genlayer.com/api",
+  "abi": {
+    "ctor": {
+      "params": [],
+      "kwparams": {}
+    },
+    "methods": {
+      "accept_escrow": {
+        "params": [
+          [
+            "escrow_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "null",
+        "payable": true
+      },
+      "approve_milestone": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "null",
+        "payable": false
+      },
+      "cancel_escrow": {
+        "params": [
+          [
+            "escrow_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "null",
+        "payable": false
+      },
+      "claim_default": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "null",
+        "payable": false
+      },
+      "create_escrow": {
+        "params": [
+          [
+            "contractor_hex",
+            "string"
+          ],
+          [
+            "repo",
+            "string"
+          ],
+          [
+            "branch",
+            "string"
+          ],
+          [
+            "title",
+            "string"
+          ],
+          [
+            "bond_bps",
+            "int"
+          ],
+          [
+            "milestones_json",
+            "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "int",
+        "payable": true
+      },
+      "evaluate_milestone_delivery": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ],
+          [
+            "commit_sha",
+            "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "dict",
+        "payable": false
+      },
+      "file_dispute": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ],
+          [
+            "reason",
+            "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "dict",
+        "payable": true
+      },
+      "get_escrow": {
+        "params": [
+          [
+            "escrow_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "dict"
+      },
+      "get_milestone": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "dict"
+      },
+      "get_solvency": {
+        "params": [],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "dict"
+      },
+      "get_stats": {
+        "params": [],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "dict"
+      },
+      "get_strikes": {
+        "params": [
+          [
+            "who_hex",
+            "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "int"
+      },
+      "list_escrows": {
+        "params": [
+          [
+            "offset",
+            "int"
+          ],
+          [
+            "limit",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "array"
+      },
+      "quote_dispute_bond": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ],
+          [
+            "who_hex",
+            "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "int"
+      },
+      "settle_milestone": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "null",
+        "payable": false
+      }
+    }
+  }
+}

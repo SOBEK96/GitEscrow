@@ -12,10 +12,12 @@ const TONES: Record<string, string> = {
   VERIFIED: "bg-ok/10 text-ok ring-ok/30",
   RELEASED: "bg-ok/15 text-ok ring-ok/40",
   DEFAULTED: "bg-bad/10 text-bad ring-bad/30",
+  FROZEN_EXTERNAL_FAULT: "bg-warn/10 text-warn ring-warn/30",
+  CANCELLED_FAULT_FREE: "bg-zinc-500/10 text-zinc-300 ring-zinc-500/30",
 };
 
 export function StatusChip({ status }: { status: EscrowStatus | MilestoneStatus }) {
-  return <span className={`chip ${TONES[status] ?? TONES.CLOSED}`}>{status}</span>;
+  return <span className={`chip ${TONES[status] ?? TONES.CLOSED}`}>{status.replace(/_/g, " ")}</span>;
 }
 
 export function Stat({ label, value, sub, accent }: { label: string; value: ReactNode; sub?: ReactNode; accent?: boolean }) {

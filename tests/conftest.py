@@ -15,6 +15,9 @@ CONTRACT = "contracts/git_escrow.py"
 ATTO = 10**18
 REPO = "acme/widgets"
 BRANCH = "main"
+REPO_ID = 424242
+CHECK = "ci/tests"
+APP_ID = 15368  # GitHub Actions
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 T0 = 1_800_000_000  # fixed block clock used by every test
@@ -44,6 +47,8 @@ def milestone_spec(**over) -> dict:
         "title": "Ship the parser",
         "reward": REWARD,
         "expected_sha": "",
+        "check_name": CHECK,
+        "app_id": APP_ID,
         "min_tests": 50,
         "min_coverage_bps": 8000,
         "deadline": T0 + 7 * DAY,
@@ -71,8 +76,10 @@ def create(c, vm, employer, contractor, specs=None, bond_bps=BOND_BPS, repo=REPO
     return int(eid)
 
 
-def accept(c, vm, contractor, eid):
+def accept(c, vm, contractor, eid, repo_state="ok"):
     esc = c.get_escrow(eid)
+    vm.clear_mocks()
+    mock_repo(vm, esc["repo"], REPO_ID, repo_state)
     fund(vm, contractor)
     as_(vm, contractor, esc["total_bond"])
     c.accept_escrow(eid)
@@ -86,54 +93,104 @@ def active_escrow(c, vm, employer, contractor, specs=None, bond_bps=BOND_BPS):
 
 
 # --- GitHub mocks -----------------------------------------------------------
+def repo_payload(full_name=REPO, repo_id=REPO_ID, private=False) -> dict:
+    return {"id": repo_id, "full_name": full_name, "private": private}
+
+
+def mock_repo(vm, repo=REPO, repo_id=REPO_ID, state="ok", full_name=None, redirect=False):
+    """Mock the repository-identity endpoints (by name, used at accept; by id, used afterwards).
+
+    state: "ok" | "gone" (404) | "private" (200 + private flag) | "error" (503).
+    redirect: the by-name endpoint answers 301 -> /repositories/{id} (a renamed repository).
+    """
+    by_id = rf"https://api\.github\.com/repositories/{repo_id}$"
+    by_name = rf"https://api\.github\.com/repos/{repo}$"
+    name = full_name or repo
+    if state == "gone":
+        vm.mock_web(by_id, {"status": 404, "body": json.dumps({"message": "Not Found"})})
+        vm.mock_web(by_name, {"status": 404, "body": json.dumps({"message": "Not Found"})})
+        return
+    if state == "error":
+        vm.mock_web(by_id, {"status": 503, "body": "unavailable"})
+        vm.mock_web(by_name, {"status": 503, "body": "unavailable"})
+        return
+    body = json.dumps(repo_payload(name, repo_id, private=(state == "private")))
+    vm.mock_web(by_id, {"status": 200, "body": body})
+    if redirect:
+        vm.mock_web(by_name, {"method": "GET", "response": {
+            "status": 301, "headers": {"location": f"https://api.github.com/repositories/{repo_id}".encode()}, "body": b""}})
+    else:
+        vm.mock_web(by_name, {"status": 200, "body": body})
+
+
+def check_text_for(tests, failed, coverage, critical) -> str:
+    return f"{tests} passed, {failed} failed. Branch coverage: {coverage}%. Critical issues: {critical}"
+
+
 def mock_github(
     vm,
     sha=SHA,
     repo=REPO,
+    repo_id=REPO_ID,
+    full_name=None,
     branch=BRANCH,
+    repo_state="ok",
     exists=True,
     on_branch=True,
     ci="success",
-    report="default",
+    tests=120,
+    failed=0,
+    coverage=91.5,
+    critical=0,
     check_text=None,
+    check_name=CHECK,
+    app_id=APP_ID,
+    decoys=(),
+    report: object = "match",
     commit_url_repo=None,
 ):
-    """Mock the four GitHub endpoints the verifier reads.
+    """Mock every GitHub endpoint the verifier reads.
 
-    report: "default" -> a passing report, dict -> that payload, None -> 404.
+    The attested check-run (name + app id) carries the authentic metrics.
+    report: "match" -> a report agreeing with the check-run, dict -> that payload, None -> absent.
+    decoys: extra check-run dicts (e.g. a great-looking run from the wrong app).
     """
     vm.clear_mocks()
-    api = rf"https://api\.github\.com/repos/{repo}"
-    if exists:
-        shown = commit_url_repo or repo
-        body = {
-            "sha": sha,
-            "url": f"https://api.github.com/repos/{shown}/commits/{sha}",
-            "html_url": f"https://github.com/{shown}/commit/{sha}",
-        }
-        vm.mock_web(rf"{api}/commits/{sha}$", {"status": 200, "body": json.dumps(body)})
-        vm.mock_web(
-            rf"{api}/compare/",
-            {"status": 200, "body": json.dumps({"status": "behind" if on_branch else "diverged"})},
-        )
-        if ci == "none":
-            runs = []
-        else:
-            run = {
-                "status": "in_progress" if ci == "pending" else "completed",
-                "conclusion": None if ci == "pending" else ("failure" if ci == "failure" else "success"),
-                "output": {"title": "CI", "summary": check_text or "", "text": ""},
-            }
-            runs = [run]
-        vm.mock_web(rf"{api}/commits/{sha}/check-runs", {"status": 200, "body": json.dumps({"check_runs": runs})})
-        if report == "default":
-            report = good_report(sha, repo)
-        if report is None:
-            vm.mock_web(r"raw\.githubusercontent\.com", {"status": 404, "body": "404: Not Found"})
-        else:
-            vm.mock_web(r"raw\.githubusercontent\.com", {"status": 200, "body": json.dumps(report)})
-    else:
+    name = full_name or repo
+    mock_repo(vm, repo, repo_id, repo_state, full_name)
+    if repo_state != "ok":
+        return
+    api = rf"https://api\.github\.com/repositories/{repo_id}"
+    if not exists:
         vm.mock_web(rf"{api}/commits/", {"status": 404, "body": json.dumps({"message": "Not Found"})})
+        return
+    shown = commit_url_repo or name
+    body = {
+        "sha": sha,
+        "url": f"https://api.github.com/repos/{shown}/commits/{sha}",
+        "html_url": f"https://github.com/{shown}/commit/{sha}",
+    }
+    vm.mock_web(rf"{api}/commits/{sha}$", {"status": 200, "body": json.dumps(body)})
+    vm.mock_web(rf"{api}/compare/", {"status": 200, "body": json.dumps({"status": "behind" if on_branch else "diverged"})})
+
+    runs = list(decoys)
+    if ci != "absent":
+        text = check_text if check_text is not None else check_text_for(tests, failed, coverage, critical)
+        runs.append({
+            "id": 101, "name": check_name, "app": {"id": app_id},
+            "status": "in_progress" if ci == "pending" else "completed",
+            "conclusion": None if ci == "pending" else ("failure" if ci == "failure" else "success"),
+            "output": {"title": "CI", "summary": text, "text": ""},
+        })
+    vm.mock_web(rf"{api}/commits/{sha}/check-runs", {"status": 200, "body": json.dumps({"check_runs": runs})})
+
+    if report == "match":
+        report = good_report(sha, name, tests_passed=tests, tests_failed=failed, branch_coverage=coverage,
+                             critical_findings=critical)
+    if report is None:
+        vm.mock_web(r"raw\.githubusercontent\.com", {"status": 404, "body": "404: Not Found"})
+    else:
+        vm.mock_web(r"raw\.githubusercontent\.com", {"status": 200, "body": json.dumps(report)})
 
 
 def good_report(sha=SHA, repo=REPO, **over):

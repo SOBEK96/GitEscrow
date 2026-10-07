@@ -3,12 +3,12 @@
 import { Plus, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useBackend } from "@/lib/backend";
-import { MAX_BOND_BPS, MAX_MILESTONES, MIN_BOND_BPS, bondFor } from "@/lib/rules";
+import { DEFAULT_APP_ID, MAX_BOND_BPS, MAX_MILESTONES, MIN_BOND_BPS, bondFor } from "@/lib/rules";
 import { fmtGen, parseGen } from "@/lib/format";
 import type { MilestoneInput } from "@/lib/types";
 import { Field } from "./ui";
 
-interface Row { title: string; reward: string; tests: string; coverage: string; deadline: string; sha: string }
+interface Row { title: string; reward: string; tests: string; coverage: string; deadline: string; sha: string; check: string; app: string }
 
 const toLocalInput = (ts: number) => {
   const d = new Date(ts * 1000);
@@ -26,7 +26,7 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
   const [title, setTitle] = useState("");
   const [bondPct, setBondPct] = useState(15);
   const [rows, setRows] = useState<Row[]>([
-    { title: "", reward: "100", tests: "50", coverage: "80", deadline: toLocalInput(realNow + 7 * 86400), sha: "" },
+    { title: "", reward: "100", tests: "50", coverage: "80", deadline: toLocalInput(realNow + 7 * 86400), sha: "", check: "ci/tests", app: String(DEFAULT_APP_ID) },
   ]);
 
   const totals = useMemo(() => {
@@ -47,6 +47,8 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
         title: r.title.trim() || `Milestone ${i + 1}`,
         reward: parseGen(r.reward),
         expectedSha: r.sha.trim().toLowerCase(),
+        checkName: r.check.trim(),
+        appId: parseInt(r.app || "0", 10),
         minTests: Math.max(0, parseInt(r.tests || "0", 10)),
         minCoverageBps: Math.round(Math.min(100, Math.max(0, parseFloat(r.coverage || "0"))) * 100),
         deadline: Math.floor(new Date(r.deadline).getTime() / 1000),
@@ -95,7 +97,9 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
                 <div><Field label="Min tests"><input className="input font-mono" inputMode="numeric" value={r.tests} onChange={(e) => patch(i, { tests: e.target.value })} /></Field></div>
                 <div><Field label="Min branch cov. %"><input className="input font-mono" inputMode="decimal" value={r.coverage} onChange={(e) => patch(i, { coverage: e.target.value })} /></Field></div>
                 <div className="md:col-span-3"><Field label="Deadline"><input type="datetime-local" className="input" value={r.deadline} onChange={(e) => patch(i, { deadline: e.target.value })} /></Field></div>
-                <div className="md:col-span-3"><Field label="Pinned commit SHA (optional)"><input className="input font-mono" value={r.sha} onChange={(e) => patch(i, { sha: e.target.value })} placeholder="40-hex, leave empty to accept any commit on the branch" /></Field></div>
+                <div className="md:col-span-3"><Field label="Attested check-run name" hint="CI check-run whose output carries the test / coverage / security numbers"><input className="input font-mono" value={r.check} onChange={(e) => patch(i, { check: e.target.value })} /></Field></div>
+                <div className="md:col-span-3"><Field label="Trusted GitHub App id" hint="15368 = GitHub Actions. Check-runs from any other app are ignored"><input className="input font-mono" inputMode="numeric" value={r.app} onChange={(e) => patch(i, { app: e.target.value })} /></Field></div>
+                <div className="md:col-span-6"><Field label="Pinned commit SHA (optional)"><input className="input font-mono" value={r.sha} onChange={(e) => patch(i, { sha: e.target.value })} placeholder="40-hex, leave empty to accept any commit on the branch" /></Field></div>
               </div>
               {rows.length > 1 && (
                 <button className="mt-2 flex items-center gap-1 text-[11px] text-zinc-500 hover:text-bad" onClick={() => setRows((rs) => rs.filter((_, j) => j !== i))}><Trash2 size={11} /> Remove</button>

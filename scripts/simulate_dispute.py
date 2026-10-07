@@ -45,15 +45,16 @@ def main() -> None:
               f"bond {gen(esc['total_bond'])} staked by contractor")
         print(f"{DIM}criteria: >=50 passing tests, >=80% branch coverage, 0 critical findings, commit on main{END}\n")
 
+        decoy = {"id": 999, "name": h.CHECK, "app": {"id": 1234}, "status": "completed", "conclusion": "success",
+                 "output": {"title": "fake", "summary": "9000 passed, 0 failed. Branch coverage: 100%. Critical issues: 0"}}
         attacks = [
             ("Ghost commit", "claims a SHA that does not exist on the repository", dict(exists=False)),
-            ("Spoofed test report", "report file forged for a different commit (claims 9999 tests)",
-             dict(report=h.good_report(sha=h.OTHER_SHA, tests_passed=9999))),
-            ("Repository swap", "commit payload served from a look-alike fork",
-             dict(commit_url_repo="evil/widgets-fork")),
+            ("Forged report.json", "report claims 5000 tests; the real CI check-run shows 12",
+             dict(tests=12, report=h.good_report(tests_passed=5000))),
+            ("Impostor check-run", "a flawless 'ci/tests' run published by a different GitHub App",
+             dict(ci="absent", decoys=[decoy], report=None)),
+            ("Repository swap", "commit payload served from a look-alike fork", dict(commit_url_repo="evil/widgets-fork")),
             ("Off-branch commit", "valid commit that was never merged into main", dict(on_branch=False)),
-            ("Cherry-picked metrics", "real commit, but only 12 tests / 41% coverage / 1 critical finding",
-             dict(report=h.good_report(tests_passed=12, branch_coverage=41.0, critical_findings=1))),
         ]
         for name, story, mock in attacks:
             h.mock_github(vm, **mock)
@@ -76,14 +77,25 @@ def main() -> None:
               f"  -> quorum fails, leader rotates, forged verdict never lands")
         assert agree is False
 
-        print(f"\n{BOLD}Ghosting{END}: contractor never delivers a valid commit")
+        print(f"\n{BOLD}Ghosting + repo veto{END}: the contractor never delivers, and the employer pulls the repository")
         fresh = h.active_escrow(c, vm, employer, contractor)
         mid = c.get_escrow(fresh)["first_milestone_id"]
+        ghost = h.active_escrow(c, vm, employer, contractor)
+        gid = c.get_escrow(ghost)["first_milestone_id"]
         vm.warp(h.iso(h.T0 + 8 * h.DAY))
         h.as_(vm, employer)
-        c.claim_default(mid)
+        h.mock_github(vm, repo_state="gone")
+        out = c.claim_default(mid)
+        print(f"  repo deleted, deadline passed -> claim_default => {out['outcome']}  (slashed: {gen(c.get_stats()['total_slashed'])})")
+        assert out["outcome"] == "FROZEN_EXTERNAL_FAULT" and c.get_stats()["total_slashed"] == 0
+
+        h.mock_github(vm)
+        h.as_(vm, employer)
+        out = c.claim_default(gid)
         stats = c.get_stats()
-        print(f"  deadline passed -> employer reclaims {gen(h.REWARD)} + slashed bond {gen(stats['total_slashed'])}")
+        print(f"  repo reachable, contractor truly absent -> {out['outcome']}: employer reclaims {gen(h.REWARD)}"
+              f" + slashed bond {gen(stats['total_slashed'])}")
+        assert out["outcome"] == "DEFAULTED"
         sol = c.get_solvency()
         print(f"\nsolvency: in={gen(sol['total_in'])} out={gen(sol['total_paid_out'])} held={gen(sol['liabilities'])} "
               f"solvent={sol['solvent']}")

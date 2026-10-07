@@ -9,11 +9,13 @@ Both paths exercise real validator consensus over live GitHub data:
   deposit -> contractor bond -> commit submission -> GenVM multi-validator
   GitHub verification -> settlement
 
-* With --repo/--sha pointing at a commit that carries `.gitescrow/report.json`
-  (see README) the delivery is VERIFIED and the employer releases the milestone.
-* Without them a real public commit that has no report is submitted. The quorum
-  rejects it (security/test evidence cannot be verified), the contractor misses
-  the deadline, and the default path slashes the bond to the employer.
+* With --repo/--sha pointing at a commit whose repository publishes a `ci/tests`
+  check-run from the GitHub Actions app (id 15368) with a summary such as
+  "120 passed, 0 failed. Branch coverage: 91%. Critical issues: 0", the delivery
+  is VERIFIED and the employer releases the milestone.
+* Without them a real public commit that has no such check-run is submitted. The
+  quorum rejects it (`ci_attestation_missing`), the contractor misses the
+  deadline, and the default path slashes the bond to the employer.
 """
 
 from __future__ import annotations
@@ -79,7 +81,7 @@ def main() -> None:
 
     print("[1/5] employer deposits the milestone reward")
     deadline = cm.now() + (3600 if expect_pass else args.deadline_seconds)
-    spec = [{"title": "Live verification milestone", "reward": str(reward), "expected_sha": "", "min_tests": 1,
+    spec = [{"title": "Live verification milestone", "reward": str(reward), "expected_sha": "", "check_name": "ci/tests", "app_id": 15368, "min_tests": 1,
              "min_coverage_bps": 0, "deadline": deadline}]
     before = cm.view(employer, addr, "get_stats")["escrow_count"]
     cm.send(employer, addr, "create_escrow", [con, args.repo, args.branch, "verify_live", 1500, json.dumps(spec)], value=reward)

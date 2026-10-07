@@ -59,7 +59,7 @@ function Dashboard() {
                 </div>
                 <MilestoneProgress escrow={escrow} selectedId={milestone.id} onSelect={setMilestoneId} />
                 <MilestoneDetail escrow={escrow} m={milestone} actorAddress={actor.address} onOutcome={onOutcome} />
-                <ConsensusPanel outcome={outcomes[milestone.id] ?? null} report={milestone.lastReport} minTests={milestone.minTests} minCoverageBps={milestone.minCoverageBps} />
+                <ConsensusPanel outcome={outcomes[milestone.id] ?? null} report={milestone.lastReport} minTests={milestone.minTests} minCoverageBps={milestone.minCoverageBps} checkName={milestone.checkName} appId={milestone.appId} />
                 <SettlementTerminal escrow={escrow} m={milestone} actorAddress={actor.address} onOutcome={onOutcome} />
               </>
             )}

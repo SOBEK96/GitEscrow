@@ -5,22 +5,30 @@
 # An employer locks milestone rewards in native GEN, a contractor stakes a
 # performance bond (10-20% of each milestone), and delivery is judged by a
 # GenVM validator quorum that independently inspects the submitted GitHub
-# commit: its existence on the target branch, its CI check-runs, and a test /
-# coverage / security report committed next to the code. No human arbiter.
+# commit: its existence on the target branch and the output of ONE named
+# GitHub Actions check-run produced by a pinned GitHub App id. A committed
+# `.gitescrow/report.json` can only corroborate that check-run, never replace it.
 #
 # Lifecycle of a milestone:
 #
 #   PENDING --evaluate (consensus PASS)--> VERIFIED --48h window--> RELEASED
-#      |                                      |
-#      |                                      +--file_dispute (escalating bond)
-#      |                                           upheld   -> RELEASED, bond to contractor
-#      |                                           overturned -> PENDING, bond refunded
-#      +--deadline passes undelivered--> DEFAULTED (employer: refund + slashed bond)
+#      |  ^                                  |
+#      |  |                                  +--file_dispute (escalating bond + non-refundable fee)
+#      |  +--overturned: deadline >= now+72h,    upheld    -> RELEASED, bond to contractor
+#      |     attempts reset, no default                      overturned -> PENDING
+#      |
+#      +--deadline + resubmit grace pass--> DEFAULTED   (employer: refund + slashed bond)
+#      |
+#      +--repository deleted / private / inaccessible--> FROZEN_EXTERNAL_FAULT
+#             +--evaluate succeeds again (repo recovered)--> PENDING (deadline extended)
+#             +--cancel_fault_free (both consent, or 7 days + repo still gone)
+#                  --> CANCELLED_FAULT_FREE: employer refunded, bond returned intact
 #
-# Verification is fully deterministic given the commit SHA (every input is
-# immutable GitHub data), so the validator function re-collects the evidence
-# itself and demands the same derived verdict. No LLM is involved: nothing the
-# contractor controls is ever interpreted as an instruction.
+# The repository is bound by its numeric GitHub id when the contractor accepts,
+# so renames and 301 redirects never break evaluation. Verification is a
+# deterministic function of immutable data (commit SHA) plus the live
+# availability of the repository, so validators re-collect the evidence
+# themselves and demand the same derived verdict. No LLM is involved.
 
 import json
 import re
@@ -50,11 +58,18 @@ BPS = 10_000
 MIN_BOND_BPS = 1_000  # contractor bond: 10% ...
 MAX_BOND_BPS = 2_000  # ... to 20% of each milestone reward
 MAX_MILESTONES = 10
-MAX_ATTEMPTS = 5  # delivery evaluations per milestone (bounds validator cost)
+MAX_ATTEMPTS = 5  # failed delivery evaluations per milestone (bounds validator cost)
+MAX_PENDING_POLLS = 20  # "CI still running" polls that do not consume an attempt
 DISPUTE_WINDOW = 48 * 3600  # seconds a verified milestone stays challengeable
+RESUBMIT_GRACE = 72 * 3600  # contractor's fresh delivery window after an overturned delivery
+FREEZE_GRACE = 7 * 86400  # frozen this long (and still unreachable) -> unilateral fault-free cancel
 MAX_DISPUTES = 3  # disputes per milestone
 MIN_DISPUTE_BOND = ATTO // 10  # 0.1 GEN floor
 DISPUTE_BASE_BPS = 100  # base dispute bond = 1% of the milestone reward
+DISPUTE_FEE_BPS = 300  # non-refundable arbitration fee = 3% of the milestone reward ...
+MIN_DISPUTE_FEE = ATTO // 50  # ... with a 0.02 GEN floor
+DEFAULT_APP_ID = 15368  # the GitHub Actions app
+MAX_CHECK_NAME_LEN = 100
 MAX_STRIKE_EXPONENT = 4  # lost disputes by one address raise its next bond up to 2^4
 MAX_TITLE_LEN = 120
 MAX_REASON_LEN = 500
@@ -69,8 +84,12 @@ MS_VERIFIED = "VERIFIED"
 MS_RELEASED = "RELEASED"
 MS_DEFAULTED = "DEFAULTED"
 MS_CANCELLED = "CANCELLED"
+MS_FROZEN = "FROZEN_EXTERNAL_FAULT"
+MS_FAULT_CANCELLED = "CANCELLED_FAULT_FREE"
 
-GITHUB_API = "https://api.github.com/repos/"
+GITHUB_ORIGIN = "https://api.github.com/"
+REPO_BY_NAME = GITHUB_ORIGIN + "repos/"
+REPO_BY_ID = GITHUB_ORIGIN + "repositories/"  # numeric id: survives renames and transfers
 RAW_GITHUB = "https://raw.githubusercontent.com/"
 REPORT_PATH = ".gitescrow/report.json"
 GITHUB_HEADERS = {
@@ -82,7 +101,7 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9_./-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
-CI_FAILING = ("failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale")
+SPOOFED_REPORT = "SPOOFED_REPORT_PAYLOAD"
 
 
 # ----------------------------------------------------------------------------
@@ -140,123 +159,189 @@ def _parse_ci_text(text: str) -> dict:
     return out
 
 
-def _summarize_check_runs(payload) -> dict:
-    """Derive a stable CI state and counters from a check-runs API payload."""
+def _select_attested_run(payload, check_name: str, app_id: int):
+    """The newest check-run with this exact name created by this exact GitHub App id."""
     runs = payload.get("check_runs") if isinstance(payload, dict) else None
-    if not isinstance(runs, list) or len(runs) == 0:
-        return {"state": "none", "passed": None, "failed": None, "coverage_bps": None, "critical": None}
-    state = "success"
-    best = {"passed": None, "failed": None, "coverage_bps": None, "critical": None}
+    if not isinstance(runs, list):
+        return None
+    best = None
+    best_id = -1
     for run in runs:
-        if not isinstance(run, dict):
+        if not isinstance(run, dict) or run.get("name") != check_name:
             continue
-        if run.get("status") != "completed":
-            if state != "failure":
-                state = "pending"
+        app = run.get("app") if isinstance(run.get("app"), dict) else {}
+        if _as_int(app.get("id"), -1) != app_id:
             continue
-        if str(run.get("conclusion")) in CI_FAILING:
-            state = "failure"
-        out = run.get("output") if isinstance(run.get("output"), dict) else {}
-        text = f"{out.get('title') or ''}\n{out.get('summary') or ''}\n{out.get('text') or ''}"
-        parsed = _parse_ci_text(text)
-        for key in best:
-            val = parsed[key]
-            if val is None:
-                continue
-            # max for positive counters (never double-count), min for coverage
-            # is not safe either way, so keep the best reported value too.
-            best[key] = val if best[key] is None else max(best[key], val)
-    return {"state": state, **best}
+        run_id = _as_int(run.get("id"), 0)
+        if best is None or run_id > best_id:
+            best, best_id = run, run_id
+    return best
 
 
-def _read_report(payload, repo: str, sha: str) -> dict:
-    """Validate a committed .gitescrow/report.json. Spoofed payloads are flagged."""
-    result = {"present": False, "spoofed": False, "passed": None, "failed": None,
-              "coverage_bps": None, "critical": None}
+def _attested_metrics(run) -> dict:
+    """CI state and metrics, read from the attested check-run's own output."""
+    if run is None:
+        return {"state": "none", "passed": None, "failed": None, "coverage_bps": None, "critical": None}
+    if run.get("status") != "completed":
+        state = "pending"
+    elif str(run.get("conclusion")) == "success":
+        state = "success"
+    else:
+        state = "failure"
+    out = run.get("output") if isinstance(run.get("output"), dict) else {}
+    text = f"{out.get('title') or ''}\n{out.get('summary') or ''}\n{out.get('text') or ''}"
+    return {"state": state, **_parse_ci_text(text)}
+
+
+def _report_mismatch(payload, names, sha: str, attested: dict) -> bool:
+    """A committed report may only corroborate the attested check-run output."""
     if not isinstance(payload, dict):
-        result["present"] = True
-        result["spoofed"] = True
-        return result
-    result["present"] = True
-    claimed_commit = str(payload.get("commit", "")).lower()
-    if claimed_commit != sha:
-        result["spoofed"] = True
-    claimed_repo = payload.get("repository")
-    if claimed_repo is not None and str(claimed_repo).lower() != repo.lower():
-        result["spoofed"] = True
-    if result["spoofed"]:
-        return result
-    result["passed"] = _as_int(payload.get("tests_passed"))
-    result["failed"] = _as_int(payload.get("tests_failed"))
+        return True
+    if str(payload.get("commit", "")).lower() != sha:
+        return True
+    claimed = payload.get("repository")
+    if claimed is not None and str(claimed).lower() not in names:
+        return True
+    claims = {
+        "passed": _as_int(payload.get("tests_passed")),
+        "failed": _as_int(payload.get("tests_failed")),
+        "critical": _as_int(payload.get("critical_findings")),
+        "coverage_bps": None,
+    }
     if payload.get("branch_coverage_bps") is not None:
-        result["coverage_bps"] = _as_int(payload.get("branch_coverage_bps"))
+        claims["coverage_bps"] = _as_int(payload.get("branch_coverage_bps"))
     elif payload.get("branch_coverage") is not None:
-        result["coverage_bps"] = _percent_to_bps(payload.get("branch_coverage"))
-    result["critical"] = _as_int(payload.get("critical_findings"))
-    return result
+        claims["coverage_bps"] = _percent_to_bps(payload.get("branch_coverage"))
+    present = {
+        "passed": payload.get("tests_passed") is not None,
+        "failed": payload.get("tests_failed") is not None,
+        "critical": payload.get("critical_findings") is not None,
+        "coverage_bps": payload.get("branch_coverage_bps") is not None or payload.get("branch_coverage") is not None,
+    }
+    for key, was_claimed in present.items():
+        if was_claimed and claims[key] != attested[key]:
+            return True
+    return False
 
 
 def _judge(ev: dict, min_tests: int, min_coverage_bps: int):
     """Apply the milestone invariants to collected evidence. Pure function."""
+    if not ev["repo_available"]:
+        return False, ["repo_unavailable"]
     failures = []
     if not ev["commit_exists"]:
         failures.append("commit_not_found")
-    elif not ev["repo_match"] or ev["spoofed"]:
+    elif not ev["repo_match"]:
         failures.append("spoofed_payload")
     elif not ev["on_branch"]:
         failures.append("commit_not_on_branch")
     if ev["commit_exists"]:
-        if ev["ci_state"] == "pending":
+        if ev["report_mismatch"]:
+            failures.append(SPOOFED_REPORT)
+        state = ev["ci_state"]
+        if state == "none":
+            failures.append("ci_attestation_missing")
+        elif state == "pending":
             failures.append("ci_pending")
-        elif ev["ci_state"] == "none":
-            failures.append("ci_missing")
-        elif ev["ci_state"] == "failure":
-            failures.append("ci_failed")
-        if ev["tests_passed"] < min_tests:
-            failures.append("tests_below_minimum")
-        if ev["tests_failed"] != 0:
-            failures.append("tests_failing")
-        if ev["coverage_bps"] < min_coverage_bps:
-            failures.append("coverage_below_minimum")
-        if ev["critical_findings"] != 0:
-            failures.append("critical_findings")
+        else:
+            if state == "failure":
+                failures.append("ci_failed")
+            if ev["tests_passed"] < min_tests:
+                failures.append("tests_below_minimum")
+            if ev["tests_failed"] != 0:
+                failures.append("tests_failing")
+            if ev["coverage_bps"] < min_coverage_bps:
+                failures.append("coverage_below_minimum")
+            if ev["critical_findings"] != 0:
+                failures.append("critical_findings")
     failures = sorted(set(failures))
     return len(failures) == 0, failures
 
 
+def _header(res, name: str) -> str:
+    headers = getattr(res, "headers", None)
+    if not headers:
+        return ""
+    try:
+        for key, value in dict(headers).items():
+            if str(key).lower() == name:
+                return _to_text(value)
+    except Exception:
+        return ""
+    return ""
+
+
 def _http_get(url: str):
-    """GET with transient/external error classification. Returns (status, text)."""
-    res = gl.nondet.web.get(url, headers=GITHUB_HEADERS)
-    status = res.status
-    if status == 429 or status == 403 or status >= 500:
-        raise gl.vm.UserError(f"{ERROR_TRANSIENT} upstream status {status}")
-    if status == 401:
-        raise gl.vm.UserError(f"{ERROR_EXTERNAL} upstream status {status}")
-    return status, _to_text(res.body)
+    """GET with (bounded) redirect following and transient/external error classification."""
+    target = url
+    for _ in range(3):
+        res = gl.nondet.web.get(target, headers=GITHUB_HEADERS)
+        status = res.status
+        if status in (301, 302, 307, 308):
+            location = _header(res, "location")
+            if location.startswith(GITHUB_ORIGIN):
+                target = location
+                continue
+            raise gl.vm.UserError(f"{ERROR_TRANSIENT} unresolved redirect {status}")
+        if status == 429 or status == 403 or status >= 500:
+            raise gl.vm.UserError(f"{ERROR_TRANSIENT} upstream status {status}")
+        if status == 401:
+            raise gl.vm.UserError(f"{ERROR_EXTERNAL} upstream status {status}")
+        return status, _to_text(res.body)
+    raise gl.vm.UserError(f"{ERROR_TRANSIENT} too many redirects")
 
 
-def _collect_evidence(repo: str, branch: str, sha: str, min_tests: int, min_coverage_bps: int) -> dict:
+def _fetch_repo(url: str) -> dict:
+    """Repository identity and availability. Deleted, private or blocked == unavailable."""
+    status, text = _http_get(url)
+    if status in (404, 410, 451):
+        return {"available": False, "id": 0, "full_name": ""}
+    if status != 200:
+        raise gl.vm.UserError(f"{ERROR_EXTERNAL} unexpected repository status {status}")
+    data = _safe_json(text)
+    if not isinstance(data, dict):
+        raise gl.vm.UserError(f"{ERROR_EXTERNAL} malformed repository payload")
+    repo_id = _as_int(data.get("id"), 0)
+    return {
+        "available": repo_id > 0 and not bool(data.get("private")),
+        "id": repo_id,
+        "full_name": str(data.get("full_name", "")),
+    }
+
+
+def _collect_evidence(repo_id: int, repo_name: str, check_name: str, app_id: int, branch: str, sha: str,
+                      min_tests: int, min_coverage_bps: int) -> dict:
     """Fetch and judge the delivery. Runs independently on every validator."""
-    base = f"{GITHUB_API}{repo}"
     ev = {
+        "repo_id": repo_id,
+        "repo_available": False,
         "commit_exists": False,
         "repo_match": False,
         "on_branch": False,
-        "spoofed": False,
         "ci_state": "none",
         "tests_passed": 0,
         "tests_failed": 0,
         "coverage_bps": 0,
         "critical_findings": -1,
+        "report_present": False,
+        "report_mismatch": False,
         "report_source": "none",
     }
+    info = _fetch_repo(f"{REPO_BY_ID}{repo_id}")
+    ev["repo_available"] = info["available"] and info["id"] == repo_id
+    if not ev["repo_available"]:
+        ev["passed"], ev["failures"] = _judge(ev, min_tests, min_coverage_bps)
+        return ev
 
-    # 1. Commit authenticity -------------------------------------------------
+    base = f"{REPO_BY_ID}{repo_id}"
+    full = info["full_name"]
+    lowered = full.lower()
+
+    # 1. Commit authenticity ----------------------------------------------------
     status, text = _http_get(f"{base}/commits/{sha}")
     if status == 200:
         data = _safe_json(text)
         if isinstance(data, dict):
-            lowered = repo.lower()
             ev["commit_exists"] = str(data.get("sha", "")).lower() == sha
             ev["repo_match"] = (
                 ev["commit_exists"]
@@ -267,56 +352,82 @@ def _collect_evidence(repo: str, branch: str, sha: str, min_tests: int, min_cove
         raise gl.vm.UserError(f"{ERROR_EXTERNAL} unexpected commit status {status}")
 
     if ev["commit_exists"]:
-        # 2. Branch containment: the commit must be an ancestor of (or equal to) the branch tip.
+        # 2. Branch containment: ancestor of (or equal to) the branch tip.
         status, text = _http_get(f"{base}/compare/{quote(branch, safe='/')}...{sha}")
         if status == 200:
             data = _safe_json(text)
             if isinstance(data, dict):
                 ev["on_branch"] = data.get("status") in ("identical", "behind")
 
-        # 3. CI check-runs bound to this exact commit.
+        # 3. The attested check-run: exact name + exact GitHub App id, bound to this commit.
         status, text = _http_get(f"{base}/commits/{sha}/check-runs?per_page=100")
-        ci = {"state": "none", "passed": None, "failed": None, "coverage_bps": None, "critical": None}
+        attested = _attested_metrics(None)
         if status == 200:
-            ci = _summarize_check_runs(_safe_json(text))
-        ev["ci_state"] = ci["state"]
+            attested = _attested_metrics(_select_attested_run(_safe_json(text), check_name, app_id))
+        ev["ci_state"] = attested["state"]
+        if attested["state"] != "none":
+            ev["report_source"] = "check_run"
+        if attested["passed"] is not None:
+            ev["tests_passed"] = attested["passed"]
+        if attested["failed"] is not None:
+            ev["tests_failed"] = attested["failed"]
+        if attested["coverage_bps"] is not None:
+            ev["coverage_bps"] = attested["coverage_bps"]
+        if attested["critical"] is not None:
+            ev["critical_findings"] = attested["critical"]
 
-        # 4. Test / coverage / security report committed at the delivery SHA.
-        status, text = _http_get(f"{RAW_GITHUB}{repo}/{sha}/{REPORT_PATH}")
-        report = {"present": False, "spoofed": False, "passed": None, "failed": None,
-                  "coverage_bps": None, "critical": None}
+        # 4. Optional committed report: may only corroborate the check-run, never override it.
+        status, text = _http_get(f"{RAW_GITHUB}{full}/{sha}/{REPORT_PATH}")
         if status == 200:
-            report = _read_report(_safe_json(text), repo, sha)
-        ev["spoofed"] = report["spoofed"]
+            ev["report_present"] = True
+            ev["report_mismatch"] = _report_mismatch(
+                _safe_json(text), (lowered, repo_name.lower()), sha, attested
+            )
 
-        source = report if (report["present"] and not report["spoofed"]) else ci
-        ev["report_source"] = "report" if source is report else ("check_runs" if ci["state"] != "none" else "none")
-        if source["passed"] is not None:
-            ev["tests_passed"] = source["passed"]
-        if source["failed"] is not None:
-            ev["tests_failed"] = source["failed"]
-        elif source["passed"] is None:
-            ev["tests_failed"] = 0
-        if source["coverage_bps"] is not None:
-            ev["coverage_bps"] = source["coverage_bps"]
-        if source["critical"] is not None:
-            ev["critical_findings"] = source["critical"]
-
-    passed, failures = _judge(ev, min_tests, min_coverage_bps)
-    ev["passed"] = passed
-    ev["failures"] = failures
+    ev["passed"], ev["failures"] = _judge(ev, min_tests, min_coverage_bps)
     return ev
 
 
 def _reports_agree(leader, mine) -> bool:
     if not isinstance(leader, dict) or not isinstance(mine, dict):
         return False
-    keys = ("passed", "failures", "commit_exists", "on_branch", "spoofed", "ci_state",
-            "tests_passed", "tests_failed", "coverage_bps", "critical_findings")
+    keys = ("passed", "failures", "repo_available", "commit_exists", "on_branch", "ci_state",
+            "tests_passed", "tests_failed", "coverage_bps", "critical_findings", "report_mismatch")
     for key in keys:
         if leader.get(key) != mine.get(key):
             return False
     return True
+
+
+def _make_validator(leader_fn, agree):
+    """Validator side of a consensus round: re-run the leader's function, compare derived verdicts."""
+
+    def validator_fn(leaders_res: gl.vm.Result) -> bool:
+        if not isinstance(leaders_res, gl.vm.Return):
+            leader_msg = getattr(leaders_res, "message", "")
+            try:
+                leader_fn()
+                return False  # leader failed but the validator could verify
+            except gl.vm.UserError as err:
+                msg = getattr(err, "message", str(err))
+                if msg.startswith(ERROR_EXPECTED) or msg.startswith(ERROR_EXTERNAL):
+                    return msg == leader_msg
+                return msg.startswith(ERROR_TRANSIENT) and leader_msg.startswith(ERROR_TRANSIENT)
+            except Exception:
+                return False
+        try:
+            mine = leader_fn()
+        except gl.vm.UserError:
+            return False
+        return agree(leaders_res.calldata, mine)
+
+    return validator_fn
+
+
+def _probe_agree(leader, mine) -> bool:
+    if not isinstance(leader, dict) or not isinstance(mine, dict):
+        return False
+    return leader.get("available") == mine.get("available") and leader.get("id") == mine.get("id")
 
 
 # ----------------------------------------------------------------------------
@@ -331,14 +442,20 @@ class Milestone:
     reward: u256
     bond: u256
     expected_sha: str
+    check_name: str
+    app_id: u256
     min_tests: u256
     min_coverage_bps: u256
     deadline: u256
     status: str
     submitted_sha: str
     attempts: u256
+    pending_polls: u256
     verified_at: u256
     release_at: u256
+    resubmit_until: u256
+    frozen_at: u256
+    consent_mask: u256
     dispute_count: u256
     last_report: str
 
@@ -349,6 +466,7 @@ class Escrow:
     employer: Address
     contractor: Address
     repo: str
+    repo_id: u256
     branch: str
     title: str
     bond_bps: u256
@@ -375,6 +493,7 @@ class GitEscrow(gl.contract.Contract):
     total_released: u256  # rewards paid to contractors
     total_slashed: u256  # bonds confiscated from defaulting contractors
     total_dispute_forfeited: u256  # failed dispute bonds paid to contractors
+    fees_retained: u256  # non-refundable dispute fees, held by the contract for good
 
     def __init__(self):
         self.escrow_count = u256(0)
@@ -385,6 +504,7 @@ class GitEscrow(gl.contract.Contract):
         self.total_released = u256(0)
         self.total_slashed = u256(0)
         self.total_dispute_forfeited = u256(0)
+        self.fees_retained = u256(0)
 
     # ------------------------------------------------------------------ utils
     def _now(self) -> int:
@@ -416,6 +536,9 @@ class GitEscrow(gl.contract.Contract):
         exponent = int(m.dispute_count) + min(strikes, MAX_STRIKE_EXPONENT)
         return base << exponent
 
+    def _dispute_fee_for(self, m: Milestone) -> int:
+        return max(MIN_DISPUTE_FEE, int(m.reward) * DISPUTE_FEE_BPS // BPS)
+
     def _close_milestone(self, e: Escrow) -> None:
         e.open_milestones -= 1
         if int(e.open_milestones) == 0 and e.status == ST_ACTIVE:
@@ -430,33 +553,37 @@ class GitEscrow(gl.contract.Contract):
         self._close_milestone(e)
         self._pay(e.contractor, reward + bond + extra_to_contractor)
 
-    def _verify(self, repo: str, branch: str, sha: str, min_tests: int, min_cov: int) -> dict:
+    def _verify(self, e: Escrow, m: Milestone, sha: str) -> dict:
+        repo_id = int(e.repo_id)
+        repo_name = e.repo
+        branch = e.branch
+        check_name = m.check_name
+        app_id = int(m.app_id)
+        min_tests = int(m.min_tests)
+        min_cov = int(m.min_coverage_bps)
+
         def leader_fn():
-            return _collect_evidence(repo, branch, sha, min_tests, min_cov)
+            return _collect_evidence(repo_id, repo_name, check_name, app_id, branch, sha, min_tests, min_cov)
 
-        def validator_fn(leaders_res: gl.vm.Result) -> bool:
-            if not isinstance(leaders_res, gl.vm.Return):
-                leader_msg = getattr(leaders_res, "message", "")
-                try:
-                    leader_fn()
-                    return False  # leader failed but the validator could verify
-                except gl.vm.UserError as err:
-                    msg = getattr(err, "message", str(err))
-                    if msg.startswith(ERROR_EXPECTED) or msg.startswith(ERROR_EXTERNAL):
-                        return msg == leader_msg
-                    return msg.startswith(ERROR_TRANSIENT) and leader_msg.startswith(ERROR_TRANSIENT)
-                except Exception:
-                    return False
-            try:
-                mine = leader_fn()
-            except gl.vm.UserError:
-                return False
-            return _reports_agree(leaders_res.calldata, mine)
+        return gl.vm.run_nondet(leader_fn, _make_validator(leader_fn, _reports_agree))
 
-        return gl.vm.run_nondet(leader_fn, validator_fn)
+    def _probe(self, url: str) -> dict:
+        def leader_fn():
+            return _fetch_repo(url)
+
+        return gl.vm.run_nondet(leader_fn, _make_validator(leader_fn, _probe_agree))
+
+    def _repo_reachable(self, e: Escrow) -> bool:
+        info = self._probe(f"{REPO_BY_ID}{int(e.repo_id)}")
+        return bool(info["available"]) and int(info["id"]) == int(e.repo_id)
 
     def _record(self, m: Milestone, report: dict) -> None:
         m.last_report = json.dumps(report, sort_keys=True)
+
+    def _extend_for_resubmit(self, m: Milestone, now: int) -> None:
+        """Fresh delivery window: the contractor is never slashed for time lost to a dispute or an outage."""
+        m.deadline = u256(max(int(m.deadline), now + RESUBMIT_GRACE))
+        m.resubmit_until = u256(now + RESUBMIT_GRACE)
 
     # ------------------------------------------------------------- escrow flow
     @gl.public.write.payable
@@ -501,6 +628,8 @@ class GitEscrow(gl.contract.Contract):
             m_title = str(spec.get("title", ""))
             reward = _as_int(spec.get("reward"), 0)
             expected_sha = str(spec.get("expected_sha", "")).lower()
+            check_name = str(spec.get("check_name", ""))
+            app_id = _as_int(spec.get("app_id", DEFAULT_APP_ID), 0)
             min_tests = _as_int(spec.get("min_tests"), -1)
             min_cov = _as_int(spec.get("min_coverage_bps"), -1)
             deadline = _as_int(spec.get("deadline"), 0)
@@ -510,6 +639,10 @@ class GitEscrow(gl.contract.Contract):
                 self._fail("milestone reward must be positive")
             if expected_sha != "" and not SHA_RE.match(expected_sha):
                 self._fail("expected_sha must be empty or a full 40-hex commit")
+            if len(check_name) == 0 or len(check_name) > MAX_CHECK_NAME_LEN:
+                self._fail("check_name (the attested GitHub check-run) is required")
+            if app_id <= 0:
+                self._fail("app_id must be a positive GitHub App id")
             if min_tests < 0 or min_cov < 0 or min_cov > BPS:
                 self._fail("invalid test or coverage threshold")
             if deadline <= now:
@@ -517,7 +650,7 @@ class GitEscrow(gl.contract.Contract):
             bond = reward * bps // BPS
             total_reward += reward
             total_bond += bond
-            parsed.append((m_title, reward, bond, expected_sha, min_tests, min_cov, deadline))
+            parsed.append((m_title, reward, bond, expected_sha, check_name, app_id, min_tests, min_cov, deadline))
 
         if int(gl.message.value) != total_reward:
             self._fail("msg.value must equal the sum of milestone rewards")
@@ -534,14 +667,20 @@ class GitEscrow(gl.contract.Contract):
                 reward=u256(p[1]),
                 bond=u256(p[2]),
                 expected_sha=p[3],
-                min_tests=u256(p[4]),
-                min_coverage_bps=u256(p[5]),
-                deadline=u256(p[6]),
+                check_name=p[4],
+                app_id=u256(p[5]),
+                min_tests=u256(p[6]),
+                min_coverage_bps=u256(p[7]),
+                deadline=u256(p[8]),
                 status=MS_PENDING,
                 submitted_sha="",
                 attempts=u256(0),
+                pending_polls=u256(0),
                 verified_at=u256(0),
                 release_at=u256(0),
+                resubmit_until=u256(0),
+                frozen_at=u256(0),
+                consent_mask=u256(0),
                 dispute_count=u256(0),
                 last_report="",
             )
@@ -549,6 +688,7 @@ class GitEscrow(gl.contract.Contract):
             employer=employer,
             contractor=contractor,
             repo=repo,
+            repo_id=u256(0),
             branch=branch,
             title=title,
             bond_bps=u256(bps),
@@ -565,7 +705,7 @@ class GitEscrow(gl.contract.Contract):
 
     @gl.public.write.payable
     def accept_escrow(self, escrow_id: u256) -> None:
-        """Contractor posts the performance bond (sum of milestone bonds) and starts the clock."""
+        """Contractor posts the bond. The quorum binds the repository's numeric id first."""
         e = self._escrow(int(escrow_id))
         if gl.message.sender_address != e.contractor:
             self._fail("only the contractor can accept")
@@ -577,6 +717,11 @@ class GitEscrow(gl.contract.Contract):
         earliest = min(int(self.milestones[u256(first + i)].deadline) for i in range(int(e.milestone_count)))
         if self._now() >= earliest:
             self._fail("a milestone deadline already passed; cancel and recreate")
+
+        info = self._probe(f"{REPO_BY_NAME}{e.repo}")
+        if not info["available"]:
+            self._fail("repository is not publicly accessible; nothing to verify")
+        e.repo_id = u256(int(info["id"]))
         e.status = ST_ACTIVE
         self.active_escrows += 1
         self.total_in += int(gl.message.value)
@@ -602,8 +747,11 @@ class GitEscrow(gl.contract.Contract):
     def evaluate_milestone_delivery(self, milestone_id: u256, commit_sha: str) -> dict:
         """Contractor submits a commit; the validator quorum verifies it on GitHub.
 
-        A failing verdict is recorded (not reverted) so the attempt counter and the
-        failure reasons persist; the contractor may fix and resubmit until the deadline.
+        A failing verdict is recorded (not reverted) so the failure reasons persist and the
+        contractor may fix and resubmit. Attempts are conserved when the verdict only says
+        "CI still running" (up to MAX_PENDING_POLLS) or the repository is unreachable;
+        transient upstream faults (5xx, rate limits, unresolved 301) revert and cost nothing.
+        A frozen milestone is revived when the repository answers again.
         """
         m = self._milestone(int(milestone_id))
         e = self.escrows[m.escrow_id]
@@ -611,10 +759,11 @@ class GitEscrow(gl.contract.Contract):
             self._fail("only the contractor can submit delivery")
         if e.status != ST_ACTIVE:
             self._fail("escrow is not active")
-        if m.status != MS_PENDING:
+        was_frozen = m.status == MS_FROZEN
+        if m.status != MS_PENDING and not was_frozen:
             self._fail("milestone is not awaiting delivery")
         now = self._now()
-        if now > int(m.deadline):
+        if not was_frozen and now > int(m.deadline):
             self._fail("milestone deadline expired")
         if int(m.attempts) >= MAX_ATTEMPTS:
             self._fail("maximum delivery attempts reached")
@@ -624,11 +773,32 @@ class GitEscrow(gl.contract.Contract):
         if m.expected_sha != "" and sha != m.expected_sha:
             self._fail("commit does not match the contract's expected_sha")
 
-        report = self._verify(e.repo, e.branch, sha, int(m.min_tests), int(m.min_coverage_bps))
-        m.attempts += 1
-        m.submitted_sha = sha
+        report = self._verify(e, m, sha)
         report["sha"] = sha
         report["evaluated_at"] = now
+
+        if not report["repo_available"]:
+            # External fault: never the contractor's fault, never an attempt, never a slash.
+            if not was_frozen:
+                m.status = MS_FROZEN
+                m.frozen_at = u256(now)
+                m.consent_mask = u256(0)
+            report["fault"] = MS_FROZEN
+            self._record(m, report)
+            return report
+
+        if was_frozen:
+            m.status = MS_PENDING
+            m.frozen_at = u256(0)
+            m.consent_mask = u256(0)
+            self._extend_for_resubmit(m, now)
+
+        m.submitted_sha = sha
+        only_pending = report["failures"] == ["ci_pending"]
+        if only_pending and int(m.pending_polls) < MAX_PENDING_POLLS:
+            m.pending_polls += 1
+        else:
+            m.attempts += 1
         self._record(m, report)
         if report["passed"]:
             m.status = MS_VERIFIED
@@ -658,32 +828,85 @@ class GitEscrow(gl.contract.Contract):
         self._release(e, m)
 
     @gl.public.write
-    def claim_default(self, milestone_id: u256) -> None:
-        """Past the deadline with no verified delivery: employer gets refund + slashed bond."""
+    def claim_default(self, milestone_id: u256) -> dict:
+        """Past the deadline AND the resubmit grace: employer gets refund + slashed bond.
+
+        The quorum first confirms the repository is reachable. If it is not, the employer
+        cannot have caused the contractor's silence by deleting it: the milestone is frozen
+        instead of slashed.
+        """
         m = self._milestone(int(milestone_id))
         e = self.escrows[m.escrow_id]
         if e.status != ST_ACTIVE:
             self._fail("escrow is not active")
         if m.status != MS_PENDING:
             self._fail("milestone is not awaiting delivery")
-        if self._now() <= int(m.deadline):
+        now = self._now()
+        if now <= int(m.deadline):
             self._fail("deadline has not passed")
+        if now <= int(m.resubmit_until):
+            self._fail("resubmit grace window still open")
+
+        if not self._repo_reachable(e):
+            m.status = MS_FROZEN
+            m.frozen_at = u256(now)
+            m.consent_mask = u256(0)
+            return {"outcome": MS_FROZEN}
+
         reward = int(m.reward)
         bond = int(m.bond)
         m.status = MS_DEFAULTED
         self.total_slashed += bond
         self._close_milestone(e)
         self._pay(e.employer, reward + bond)
+        return {"outcome": MS_DEFAULTED}
+
+    @gl.public.write
+    def cancel_fault_free(self, milestone_id: u256) -> dict:
+        """Neutral exit for a frozen milestone: employer refunded, contractor bond returned intact.
+
+        Needs both parties' consent, or FREEZE_GRACE of freeze plus a fresh quorum
+        confirmation that the repository is still unreachable.
+        """
+        m = self._milestone(int(milestone_id))
+        e = self.escrows[m.escrow_id]
+        sender = gl.message.sender_address
+        if sender == e.employer:
+            bit = 1
+        elif sender == e.contractor:
+            bit = 2
+        else:
+            self._fail("only the employer or the contractor can cancel")
+        if m.status != MS_FROZEN:
+            self._fail("milestone is not frozen by an external fault")
+
+        mask = int(m.consent_mask) | bit
+        m.consent_mask = u256(mask)
+        if mask != 3:
+            if self._now() < int(m.frozen_at) + FREEZE_GRACE:
+                return {"outcome": "CONSENT_RECORDED", "consent_mask": mask}
+            if self._repo_reachable(e):
+                self._fail("repository is reachable again; resubmit through evaluate_milestone_delivery")
+
+        reward = int(m.reward)
+        bond = int(m.bond)
+        m.status = MS_FAULT_CANCELLED
+        self._close_milestone(e)
+        self._pay(e.employer, reward)
+        self._pay(e.contractor, bond)
+        return {"outcome": MS_FAULT_CANCELLED}
 
     # ---------------------------------------------------------------- disputes
     @gl.public.write.payable
     def file_dispute(self, milestone_id: u256, reason: str) -> dict:
         """Employer challenges a verified milestone inside the 48h window.
 
-        The bond doubles with every dispute on the milestone and with every dispute
-        this address already lost. A fresh quorum re-verifies the same commit:
+        Cost = escalating refundable bond + non-refundable fee (3% of reward, retained
+        by the contract). A fresh quorum re-verifies the same commit:
           * upheld     -> bond is forfeited to the contractor, milestone releases now
-          * overturned -> bond refunded, milestone returns to PENDING for resubmission
+          * overturned -> bond refunded, milestone returns to PENDING and the contractor gets
+                          a fresh 72h delivery window (deadline = max(deadline, now + 72h))
+        A dispute cannot be decided while the repository is unreachable or CI is re-running.
         """
         m = self._milestone(int(milestone_id))
         e = self.escrows[m.escrow_id]
@@ -700,30 +923,41 @@ class GitEscrow(gl.contract.Contract):
         if len(reason) == 0 or len(reason) > MAX_REASON_LEN:
             self._fail("invalid dispute reason")
         who = sender.as_hex
-        required = self._dispute_bond_for(m, who)
-        bond_paid = int(gl.message.value)
-        if bond_paid != required:
-            self._fail(f"dispute bond must be exactly {required}")
+        bond = self._dispute_bond_for(m, who)
+        fee = self._dispute_fee_for(m)
+        paid = int(gl.message.value)
+        if paid != bond + fee:
+            self._fail(f"dispute cost must be exactly {bond + fee} (bond {bond} + non-refundable fee {fee})")
 
-        self.total_in += bond_paid
+        report = self._verify(e, m, m.submitted_sha)
+        if not report["repo_available"]:
+            self._fail("repository is unreachable; a dispute cannot be decided")
+        if report["failures"] == ["ci_pending"]:
+            self._fail("CI is re-running; dispute once the check-run completes")
+
+        self.total_in += paid
+        self.fees_retained += fee
         m.dispute_count += 1
-        report = self._verify(e.repo, e.branch, m.submitted_sha, int(m.min_tests), int(m.min_coverage_bps))
         report["sha"] = m.submitted_sha
         report["evaluated_at"] = now
         report["dispute_reason"] = reason
-        self._record(m, report)
 
         if report["passed"]:
             self.strikes[who] = u256((int(self.strikes[who]) if who in self.strikes else 0) + 1)
-            self.total_dispute_forfeited += bond_paid
-            self._release(e, m, extra_to_contractor=bond_paid)
+            self.total_dispute_forfeited += bond
             report["dispute_outcome"] = "UPHELD_DELIVERY"
+            self._record(m, report)
+            self._release(e, m, extra_to_contractor=bond)
         else:
+            report["dispute_outcome"] = "DELIVERY_OVERTURNED"
+            self._record(m, report)
             m.status = MS_PENDING
             m.verified_at = u256(0)
             m.release_at = u256(0)
-            self._pay(sender, bond_paid)
-            report["dispute_outcome"] = "DELIVERY_OVERTURNED"
+            m.attempts = u256(0)
+            m.pending_polls = u256(0)
+            self._extend_for_resubmit(m, now)
+            self._pay(sender, bond)
         return report
 
     # ------------------------------------------------------------------- views
@@ -738,16 +972,23 @@ class GitEscrow(gl.contract.Contract):
             "reward": int(m.reward),
             "bond": int(m.bond),
             "expected_sha": m.expected_sha,
+            "check_name": m.check_name,
+            "app_id": int(m.app_id),
             "min_tests": int(m.min_tests),
             "min_coverage_bps": int(m.min_coverage_bps),
             "deadline": int(m.deadline),
             "status": m.status,
             "submitted_sha": m.submitted_sha,
             "attempts": int(m.attempts),
+            "pending_polls": int(m.pending_polls),
             "verified_at": int(m.verified_at),
             "release_at": int(m.release_at),
+            "resubmit_until": int(m.resubmit_until),
+            "frozen_at": int(m.frozen_at),
+            "consent_mask": int(m.consent_mask),
             "dispute_count": int(m.dispute_count),
             "next_dispute_bond": self._dispute_bond_for(m, e.employer.as_hex),
+            "next_dispute_fee": self._dispute_fee_for(m),
             "last_report": m.last_report,
         }
 
@@ -759,6 +1000,7 @@ class GitEscrow(gl.contract.Contract):
             "employer": e.employer.as_hex,
             "contractor": e.contractor.as_hex,
             "repo": e.repo,
+            "repo_id": int(e.repo_id),
             "branch": e.branch,
             "title": e.title,
             "bond_bps": int(e.bond_bps),
@@ -795,42 +1037,54 @@ class GitEscrow(gl.contract.Contract):
         return self._dispute_bond_for(m, Address(who_hex).as_hex)
 
     @gl.public.view
+    def quote_dispute_fee(self, milestone_id: u256) -> int:
+        return self._dispute_fee_for(self._milestone(int(milestone_id)))
+
+    @gl.public.view
     def get_strikes(self, who_hex: str) -> int:
         key = Address(who_hex).as_hex
         return int(self.strikes[key]) if key in self.strikes else 0
 
-    @gl.public.view
-    def get_stats(self) -> dict:
+    def _liabilities(self) -> dict:
         locked = 0
         bonded = 0
         for mid in range(1, int(self.milestone_total) + 1):
             m = self.milestones[u256(mid)]
-            if m.status in (MS_PENDING, MS_VERIFIED):
+            if m.status in (MS_PENDING, MS_VERIFIED, MS_FROZEN):
                 e = self.escrows[m.escrow_id]
                 locked += int(m.reward)
                 if e.status == ST_ACTIVE:
                     bonded += int(m.bond)
+        return {"rewards": locked, "bonds": bonded}
+
+    @gl.public.view
+    def get_stats(self) -> dict:
+        held = self._liabilities()
         return {
             "escrow_count": int(self.escrow_count),
             "milestone_count": int(self.milestone_total),
             "active_escrows": int(self.active_escrows),
-            "tvl": locked + bonded,
-            "locked_rewards": locked,
-            "locked_bonds": bonded,
+            "tvl": held["rewards"] + held["bonds"],
+            "locked_rewards": held["rewards"],
+            "locked_bonds": held["bonds"],
             "total_released": int(self.total_released),
             "total_slashed": int(self.total_slashed),
             "total_dispute_forfeited": int(self.total_dispute_forfeited),
+            "fees_retained": int(self.fees_retained),
         }
 
     @gl.public.view
     def get_solvency(self) -> dict:
-        """Invariant: total_in == total_paid_out + liabilities (nothing is ever created or lost)."""
-        liabilities = int(self.get_stats()["tvl"])
+        """Invariant: total_in == total_paid_out + liabilities + fees_retained."""
+        held = self._liabilities()
+        liabilities = held["rewards"] + held["bonds"]
         total_in = int(self.total_in)
         paid = int(self.total_paid_out)
+        fees = int(self.fees_retained)
         return {
             "total_in": total_in,
             "total_paid_out": paid,
             "liabilities": liabilities,
-            "solvent": total_in == paid + liabilities,
+            "fees_retained": fees,
+            "solvent": total_in == paid + liabilities + fees,
         }

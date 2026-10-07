@@ -2,10 +2,10 @@
   "network": "studio-next",
   "chain_id": 61997,
   "rpc_url": "https://studio-next.genlayer.com/api",
-  "contract_address": "0xF461Aef48b527D020715B18966f03c4ABE75Da11",
-  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0xF461Aef48b527D020715B18966f03c4ABE75Da11",
+  "contract_address": "0xfc5ecf7910e25c85b36c4D958c2Ea2e6F9B6e303",
+  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0xfc5ecf7910e25c85b36c4D958c2Ea2e6F9B6e303",
   "source": "contracts/git_escrow.py",
-  "source_sha256": "b87c85b6d86ed58301a215f2f19f0e6fbb6eb53e443553fb7f8ea1ab63fe83d1",
+  "source_sha256": "8c702d64dfc78b3a2907c288599daa00c746a59c638a98603d04208b9048ac62",
   "employer": "0x3B3570A48224eB6608344C62BceF2f9694fa0f09",
   "contractor": "0xF715F85826afeE221B73F78D8cf5c3942F431F2d",
   "abi": {
@@ -50,6 +50,18 @@
         "ret": "null",
         "payable": false
       },
+      "cancel_fault_free": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": false,
+        "ret": "dict",
+        "payable": false
+      },
       "claim_default": {
         "params": [
           [
@@ -59,7 +71,7 @@
         ],
         "kwparams": {},
         "readonly": false,
-        "ret": "null",
+        "ret": "dict",
         "payable": false
       },
       "create_escrow": {
@@ -195,6 +207,17 @@
           [
             "who_hex",
             "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "int"
+      },
+      "quote_dispute_fee": {
+        "params": [
+          [
+            "milestone_id",
+            "int"
           ]
         ],
         "kwparams": {},

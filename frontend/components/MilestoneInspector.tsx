@@ -38,7 +38,8 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
   const [sha, setSha] = useState("");
   const isContractor = actorAddress.toLowerCase() === escrow.contractor.toLowerCase();
   const expired = snap.now > m.deadline;
-  const canDeliver = escrow.status === "ACTIVE" && m.status === "PENDING" && isContractor && !expired && m.attempts < MAX_ATTEMPTS;
+  const frozen = m.status === "FROZEN_EXTERNAL_FAULT";
+  const canDeliver = escrow.status === "ACTIVE" && (m.status === "PENDING" || frozen) && isContractor && (frozen || !expired) && m.attempts < MAX_ATTEMPTS;
 
   async function deliver() {
     const out = await run(() => backend.evaluate(actorAddress, m.id, sha || m.expectedSha));
@@ -57,12 +58,13 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
       </dl>
       <div className="mt-2 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
         <Criterion label="Critical findings" value="0 allowed" />
-        <Criterion label="Deadline" value={fmtDate(m.deadline)} tone={expired && m.status === "PENDING" ? "bad" : undefined} />
-        <Criterion label="Attempts" value={`${m.attempts} / ${MAX_ATTEMPTS}`} />
+        <Criterion label="Attested check-run" value={`${m.checkName} · app ${m.appId}`} />
+        <Criterion label="Deadline" value={fmtDate(m.deadline)} tone={expired && m.status === "PENDING" && snap.now > m.resubmitUntil ? "bad" : undefined} />
+        <Criterion label="Attempts" value={`${m.attempts} / ${MAX_ATTEMPTS}${m.pendingPolls ? ` · ${m.pendingPolls} CI polls` : ""}`} />
         <Criterion label="Submitted" value={m.submittedSha ? shortSha(m.submittedSha) : "—"} />
       </div>
 
-      {m.status === "PENDING" && (
+      {(m.status === "PENDING" || frozen) && (
         <div className="mt-5 rounded-xl bg-ink-850 p-4 ring-1 ring-white/5">
           <div className="label">Deliverable submission</div>
           <div className="mt-2 flex flex-col gap-2 md:flex-row">
@@ -72,7 +74,9 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
           </div>
           {!isContractor && <p className="mt-2 text-xs text-zinc-500">Only the contractor can submit a commit. Switch persona to submit.</p>}
           {isContractor && escrow.status !== "ACTIVE" && <p className="mt-2 text-xs text-warn">Post the performance bond first to activate this escrow.</p>}
-          {expired && <p className="mt-2 text-xs text-bad">Deadline passed — the employer may claim a default.</p>}
+          {expired && m.status === "PENDING" && snap.now <= m.resubmitUntil && <p className="mt-2 text-xs text-warn">Resubmit grace window: the deadline was extended after an overturned delivery.</p>}
+          {expired && m.status === "PENDING" && snap.now > m.resubmitUntil && <p className="mt-2 text-xs text-bad">Deadline passed — the employer may claim a default.</p>}
+          {frozen && <p className="mt-2 text-xs text-warn">Frozen: the repository was unreachable. Submitting again revives the milestone once it answers.</p>}
         </div>
       )}
     </Section>

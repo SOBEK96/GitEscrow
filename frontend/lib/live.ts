@@ -43,16 +43,17 @@ function parseReport(raw: Any): Report | null {
 function toMilestone(m: Any): Milestone {
   return {
     id: num(m.id), escrowId: num(m.escrow_id), index: num(m.index), title: m.title, reward: big(m.reward),
-    bond: big(m.bond), expectedSha: m.expected_sha, minTests: num(m.min_tests), minCoverageBps: num(m.min_coverage_bps),
+    bond: big(m.bond), expectedSha: m.expected_sha, checkName: m.check_name, appId: num(m.app_id), minTests: num(m.min_tests), minCoverageBps: num(m.min_coverage_bps),
     deadline: num(m.deadline), status: m.status, submittedSha: m.submitted_sha, attempts: num(m.attempts),
-    verifiedAt: num(m.verified_at), releaseAt: num(m.release_at), disputeCount: num(m.dispute_count),
-    nextDisputeBond: big(m.next_dispute_bond), lastReport: parseReport(m.last_report),
+    pendingPolls: num(m.pending_polls), verifiedAt: num(m.verified_at), releaseAt: num(m.release_at),
+    resubmitUntil: num(m.resubmit_until), frozenAt: num(m.frozen_at), consentMask: num(m.consent_mask),
+    disputeCount: num(m.dispute_count), nextDisputeBond: big(m.next_dispute_bond), nextDisputeFee: big(m.next_dispute_fee), lastReport: parseReport(m.last_report),
   };
 }
 
 function toEscrow(e: Any): Escrow {
   return {
-    id: num(e.id), employer: e.employer, contractor: e.contractor, repo: e.repo, branch: e.branch, title: e.title,
+    id: num(e.id), employer: e.employer, contractor: e.contractor, repo: e.repo, repoId: num(e.repo_id), branch: e.branch, title: e.title,
     bondBps: num(e.bond_bps), totalReward: big(e.total_reward), totalBond: big(e.total_bond),
     openMilestones: num(e.open_milestones), createdAt: num(e.created_at), status: e.status,
     milestones: (e.milestones ?? []).map(toMilestone),
@@ -159,18 +160,18 @@ export class LiveBackend implements Backend {
     return {
       escrowCount: num(s.escrow_count), activeEscrows: num(s.active_escrows), tvl: big(s.tvl),
       lockedRewards: big(s.locked_rewards), lockedBonds: big(s.locked_bonds), totalReleased: big(s.total_released),
-      totalSlashed: big(s.total_slashed), totalDisputeForfeited: big(s.total_dispute_forfeited),
+      totalSlashed: big(s.total_slashed), totalDisputeForfeited: big(s.total_dispute_forfeited), feesRetained: big(s.fees_retained),
     };
   }
 
   async solvency(): Promise<Solvency> {
     const s = await this.read("get_solvency");
-    return { totalIn: big(s.total_in), totalPaidOut: big(s.total_paid_out), liabilities: big(s.liabilities), solvent: Boolean(s.solvent) };
+    return { totalIn: big(s.total_in), totalPaidOut: big(s.total_paid_out), liabilities: big(s.liabilities), feesRetained: big(s.fees_retained), solvent: Boolean(s.solvent) };
   }
 
   async createEscrow(_by: string, input: CreateEscrowInput): Promise<number> {
     const specs = input.milestones.map((m) => ({
-      title: m.title, reward: m.reward.toString(), expected_sha: m.expectedSha, min_tests: m.minTests,
+      title: m.title, reward: m.reward.toString(), expected_sha: m.expectedSha, check_name: m.checkName, app_id: m.appId, min_tests: m.minTests,
       min_coverage_bps: m.minCoverageBps, deadline: m.deadline,
     }));
     const total = input.milestones.reduce((a, m) => a + m.reward, 0n);
@@ -186,7 +187,19 @@ export class LiveBackend implements Backend {
   async cancelEscrow(_by: string, escrowId: number) { await this.write("cancel_escrow", [BigInt(escrowId)]); }
   async settle(_by: string, id: number) { await this.write("settle_milestone", [BigInt(id)]); }
   async approve(_by: string, id: number) { await this.write("approve_milestone", [BigInt(id)]); }
-  async claimDefault(_by: string, id: number) { await this.write("claim_default", [BigInt(id)]); }
+  async claimDefault(_by: string, id: number): Promise<string> {
+    await this.write("claim_default", [BigInt(id)]);
+    return (await this.read("get_milestone", [BigInt(id)])).status;
+  }
+
+  async cancelFaultFree(_by: string, id: number): Promise<string> {
+    await this.write("cancel_fault_free", [BigInt(id)]);
+    return (await this.read("get_milestone", [BigInt(id)])).status;
+  }
+
+  async quoteDisputeFee(milestoneId: number): Promise<bigint> {
+    return big(await this.read("quote_dispute_fee", [BigInt(milestoneId)]));
+  }
 
   async quoteDisputeBond(milestoneId: number, who: string): Promise<bigint> {
     return big(await this.read("quote_dispute_bond", [BigInt(milestoneId), who]));
@@ -206,8 +219,9 @@ export class LiveBackend implements Backend {
 
   async fileDispute(_by: string, milestoneId: number, reason: string): Promise<Outcome> {
     const { account } = await this.ctx();
-    const bond = await this.quoteDisputeBond(milestoneId, account.address);
-    const tx = await this.write("file_dispute", [BigInt(milestoneId), reason], bond);
+    // The contract demands exactly: escalating refundable bond + non-refundable arbitration fee.
+    const cost = (await this.quoteDisputeBond(milestoneId, account.address)) + (await this.quoteDisputeFee(milestoneId));
+    const tx = await this.write("file_dispute", [BigInt(milestoneId), reason], cost);
     return this.outcome(milestoneId, tx);
   }
 }

@@ -1,7 +1,9 @@
 // Shared domain types. Amounts are wei-scale bigints (1 GEN = 10^18).
 
 export type EscrowStatus = "OPEN" | "ACTIVE" | "CLOSED" | "CANCELLED";
-export type MilestoneStatus = "PENDING" | "VERIFIED" | "RELEASED" | "DEFAULTED" | "CANCELLED";
+export type MilestoneStatus =
+  | "PENDING" | "VERIFIED" | "RELEASED" | "DEFAULTED" | "CANCELLED"
+  | "FROZEN_EXTERNAL_FAULT" | "CANCELLED_FAULT_FREE";
 
 export type CiState = "success" | "failure" | "pending" | "none";
 
@@ -9,16 +11,20 @@ export type CiState = "success" | "failure" | "pending" | "none";
 export interface Report {
   passed: boolean;
   failures: string[];
+  repo_id?: number;
+  repo_available: boolean;
   commit_exists: boolean;
   repo_match: boolean;
   on_branch: boolean;
-  spoofed: boolean;
   ci_state: CiState;
   tests_passed: number;
   tests_failed: number;
   coverage_bps: number;
   critical_findings: number; // -1 means "could not be verified"
-  report_source: "report" | "check_runs" | "none";
+  report_present: boolean;
+  report_mismatch: boolean;
+  report_source: "check_run" | "none";
+  fault?: string;
   sha?: string;
   evaluated_at?: number;
   dispute_reason?: string;
@@ -33,16 +39,23 @@ export interface Milestone {
   reward: bigint;
   bond: bigint;
   expectedSha: string;
+  checkName: string;
+  appId: number;
   minTests: number;
   minCoverageBps: number;
   deadline: number;
   status: MilestoneStatus;
   submittedSha: string;
   attempts: number;
+  pendingPolls: number;
   verifiedAt: number;
   releaseAt: number;
+  resubmitUntil: number;
+  frozenAt: number;
+  consentMask: number;
   disputeCount: number;
   nextDisputeBond: bigint;
+  nextDisputeFee: bigint;
   lastReport: Report | null;
 }
 
@@ -51,6 +64,7 @@ export interface Escrow {
   employer: string;
   contractor: string;
   repo: string;
+  repoId: number;
   branch: string;
   title: string;
   bondBps: number;
@@ -71,12 +85,14 @@ export interface Stats {
   totalReleased: bigint;
   totalSlashed: bigint;
   totalDisputeForfeited: bigint;
+  feesRetained: bigint;
 }
 
 export interface Solvency {
   totalIn: bigint;
   totalPaidOut: bigint;
   liabilities: bigint;
+  feesRetained: bigint;
   solvent: boolean;
 }
 
@@ -109,6 +125,8 @@ export interface MilestoneInput {
   title: string;
   reward: bigint;
   expectedSha: string;
+  checkName: string;
+  appId: number;
   minTests: number;
   minCoverageBps: number;
   deadline: number;
@@ -143,7 +161,9 @@ export interface Backend {
   evaluate(by: string, milestoneId: number, sha: string): Promise<Outcome>;
   settle(by: string, milestoneId: number): Promise<void>;
   approve(by: string, milestoneId: number): Promise<void>;
-  claimDefault(by: string, milestoneId: number): Promise<void>;
+  claimDefault(by: string, milestoneId: number): Promise<string>;
+  cancelFaultFree(by: string, milestoneId: number): Promise<string>;
   quoteDisputeBond(milestoneId: number, who: string): Promise<bigint>;
+  quoteDisputeFee(milestoneId: number): Promise<bigint>;
   fileDispute(by: string, milestoneId: number, reason: string): Promise<Outcome>;
 }

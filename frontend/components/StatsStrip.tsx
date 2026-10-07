@@ -22,7 +22,7 @@ export function StatsStrip() {
           <ShieldCheck size={20} /> {sol ? (sol.solvent ? "Balanced" : "MISMATCH") : "—"}
         </div>
         <div className="mt-1 font-mono text-[11px] text-zinc-500">
-          {sol ? `in ${fmtGen(sol.totalIn)} = out ${fmtGen(sol.totalPaidOut)} + held ${fmtGen(sol.liabilities)}` : ""}
+          {sol ? `in ${fmtGen(sol.totalIn)} = out ${fmtGen(sol.totalPaidOut)} + held ${fmtGen(sol.liabilities)}${sol.feesRetained > 0n ? ` + fees ${fmtGen(sol.feesRetained)}` : ""}` : ""}
         </div>
       </div>
     </div>

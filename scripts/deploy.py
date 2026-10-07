@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Deploy GitEscrow to GenLayer Studio Next, seed demo escrows, export artifacts.
 
-    python scripts/deploy.py [--no-demo]
+    python -m scripts.deploy [--no-demo]
 
 Outputs
   deployments/studio-next.json          address, explorer link, source hash, ABI
   frontend/lib/gitescrow.generated.json address + ABI for the dashboard
-  frontend/.env.local                   NEXT_PUBLIC_GITESCROW_ADDRESS for Live mode
+  frontend/lib/config.ts                CONTRACT_ADDRESS (drives the dashboard and the footer links)
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 
@@ -43,7 +44,7 @@ def seed_demo(c, address: str, contractor_addr: str) -> None:
         ]),
     ]
     for title, repo, branch, bps, miles in demo:
-        specs = [{"title": n, "reward": str(r * cm.ATTO // 10), "expected_sha": "", "min_tests": tests,
+        specs = [{"title": n, "reward": str(r * cm.ATTO // 10), "expected_sha": "", "check_name": "ci/tests", "app_id": 15368, "min_tests": tests,
                   "min_coverage_bps": cov, "deadline": dl} for n, r, tests, cov, dl in miles]
         total = sum(int(s["reward"]) for s in specs)
         cm.send(c, address, "create_escrow", [contractor_addr, repo, branch, title, bps, json.dumps(specs)],
@@ -100,9 +101,10 @@ def main() -> None:
     (front / "lib").mkdir(parents=True, exist_ok=True)
     (front / "lib" / "gitescrow.generated.json").write_text(
         json.dumps({"address": address, "chainId": 61997, "rpcUrl": cm.RPC_URL, "abi": abi}, indent=2) + "\n")
-    (front / ".env.local").write_text(
-        f"NEXT_PUBLIC_GITESCROW_ADDRESS={address}\nNEXT_PUBLIC_GENLAYER_RPC_URL={cm.RPC_URL}\n")
-    print(f"recorded  {cm.DEPLOYMENT_FILE.relative_to(cm.ROOT)}  (restart `npm run dev` to enable Live mode)")
+    config = front / "lib" / "config.ts"
+    text = config.read_text()
+    config.write_text(re.sub(r'CONTRACT_ADDRESS = "0x[0-9a-fA-F]{40}"', f'CONTRACT_ADDRESS = "{address}"', text))
+    print(f"recorded  {cm.DEPLOYMENT_FILE.relative_to(cm.ROOT)}  (frontend/lib/config.ts updated)")
 
 
 if __name__ == "__main__":

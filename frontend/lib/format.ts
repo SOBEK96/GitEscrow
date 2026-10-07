@@ -50,12 +50,14 @@ export function fmtDate(ts: number): string {
 }
 
 export const FAILURE_LABELS: Record<string, string> = {
+  repo_unavailable: "Repository is deleted, private or unreachable (external fault)",
   commit_not_found: "Commit does not exist on the repository",
-  spoofed_payload: "Spoofed payload: report or commit belongs to another repository / commit",
+  spoofed_payload: "Spoofed payload: commit belongs to another repository",
+  SPOOFED_REPORT_PAYLOAD: "report.json contradicts the authentic CI check-run output",
   commit_not_on_branch: "Commit is not part of the target branch history",
-  ci_pending: "CI check-runs are still running",
-  ci_missing: "No CI check-runs found for this commit",
-  ci_failed: "CI check-runs failed",
+  ci_pending: "Attested check-run still running (no attempt consumed)",
+  ci_attestation_missing: "No check-run with the required name from the trusted GitHub App",
+  ci_failed: "The attested CI check-run failed",
   tests_below_minimum: "Passing test count below the contract minimum",
   tests_failing: "Failing tests present",
   coverage_below_minimum: "Branch coverage below the contract minimum",

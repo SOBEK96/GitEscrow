@@ -13,6 +13,12 @@ export const MAX_DISPUTES = 3;
 export const MIN_DISPUTE_BOND = ATTO / 10n;
 export const DISPUTE_BASE_BPS = 100n;
 export const MAX_STRIKE_EXPONENT = 4;
+export const RESUBMIT_GRACE = 72 * 3600;
+export const FREEZE_GRACE = 7 * 86400;
+export const MAX_PENDING_POLLS = 20;
+export const DISPUTE_FEE_BPS = 300n;
+export const MIN_DISPUTE_FEE = ATTO / 50n;
+export const DEFAULT_APP_ID = 15368;
 
 export function bondFor(reward: bigint, bondBps: number): bigint {
   return (reward * BigInt(bondBps)) / BigInt(BPS);
@@ -23,4 +29,10 @@ export function disputeBond(reward: bigint, disputeCount: number, strikes: numbe
   const pct = (reward * DISPUTE_BASE_BPS) / BigInt(BPS);
   const base = pct > MIN_DISPUTE_BOND ? pct : MIN_DISPUTE_BOND;
   return base << BigInt(disputeCount + Math.min(strikes, MAX_STRIKE_EXPONENT));
+}
+
+/** Non-refundable arbitration fee: 3% of the reward, never below 0.02 GEN. */
+export function disputeFee(reward: bigint): bigint {
+  const pct = (reward * DISPUTE_FEE_BPS) / BigInt(BPS);
+  return pct > MIN_DISPUTE_FEE ? pct : MIN_DISPUTE_FEE;
 }

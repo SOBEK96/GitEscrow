@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ATTO, fmtGen, parseGen } from "./format";
-import { bondFor, disputeBond, MAX_DISPUTES } from "./rules";
+import { bondFor, disputeBond, disputeFee, MAX_DISPUTES } from "./rules";
 
 test("bond math: 15% of 100 GEN", () => {
   assert.equal(bondFor(100n * ATTO, 1500), 15n * ATTO);
@@ -25,4 +25,9 @@ test("GEN formatting round-trips", () => {
   assert.equal(parseGen("1.5"), 15n * ATTO / 10n);
   assert.equal(fmtGen(1234n * ATTO + ATTO / 2n), "1,234.5");
   assert.throws(() => parseGen("-1"));
+});
+
+test("dispute fee is 3% of the reward with a 0.02 GEN floor", () => {
+  assert.equal(disputeFee(100n * ATTO), 3n * ATTO);
+  assert.equal(disputeFee(ATTO / 10n), ATTO / 50n);
 });

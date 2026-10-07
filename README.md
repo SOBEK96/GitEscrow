@@ -221,6 +221,29 @@ Branch heads, check-run states and repository visibility are **mutable off-chain
 * **Re-run and rewrite attacks.** Disputes are pinned to the check-run recorded at delivery, so re-running CI (a new run id) does nothing; they never re-evaluate the branch, so force-pushing, resetting or deleting it does nothing; and they are refused while the pinned run is `pending` or the repository is unreachable. The only way to overturn is for the *pinned evidence itself* to change (the app updates that run to a failure, or the run or commit disappears), in which case the contractor gets the 72h resubmit window.
 * **Branch tip is irrelevant after delivery.** Ref containment is checked once, at submission. After that the delivery stands on its SHA.
 
+### Commit Baseline & Author Binding Limitation
+
+Milestone evaluation answers one question: *does this commit exist in the agreed delivery ref (target branch, a branch, or the head of `pull/N`) and does the pinned check-run for that exact SHA report passing results above the milestone's thresholds?* It does **not**:
+
+* **attest the Git author.** There is no check that the commit was written, signed or pushed by the contractor (no GPG/SSH signature verification, no author or committer matching). Anyone can submit any SHA, and the contract treats a green commit as a green commit.
+* **diff against a baseline.** It does not compare the commit with the repository's state at escrow creation, so it cannot tell *new* work from work that already existed.
+
+Consequently an **already-existing green commit**, or the head of a **third-party pull request** that happens to satisfy the thresholds, can satisfy a milestone that was never actually worked on. GitEscrow cannot detect this on-chain; the employer must close the gap when creating the milestone:
+
+* **Calibrate thresholds above the current baseline.** Set `min_tests` and `min_coverage_bps` to realistic *incremental* values: strictly more passing tests, and strictly higher branch coverage, than the repository has today. A milestone whose bar is already cleared by `main` is paid out on day one.
+* **Or pin an explicit `expected_sha`.** A non-empty `expected_sha` makes the contract accept exactly that commit and nothing else. This is the strongest guard, but it means agreeing on the delivery commit up front (for example a SHA the employer has reviewed and tagged), so use it for fixed, reviewable deliverables.
+* Prefer an `app_id`/`check_name` pair the contractor cannot satisfy with someone else's code (see below) and review the PR before bonding.
+
+### Check-Run Persistence & Workflow Control
+
+* **Check-runs must stay on the GitHub Checks API.** Validators read the check-run's `output` at verification time and again, pinned by run id, if the delivery is disputed. If a check-run is deleted or its app is uninstalled, a re-check finds no pinned run and reports `ci_attestation_missing`, which is the one thing that can overturn an already verified delivery. Keep the CI app installed and do not prune check-runs for delivered SHAs until the milestone is `RELEASED`.
+* **Why an employer-owned repo with a pinned `check_name` matters.** The attested check-run is only as trustworthy as whoever controls the workflow that produces it. In a contractor-owned repo the contractor writes the workflow and can make it print any numbers under the right name. In an employer-owned repo, the employer fixes the workflow and the exact `check_name` / `app_id` in the milestone, so a contractor PR cannot invent a check-run that validators will accept: check-runs from other names or other apps are ignored outright, and a committed `report.json` can only corroborate the real one.
+* **Caveat: the workflow file itself must be protected.** For the plain `pull_request` trigger, GitHub runs the workflow definition from the PR's own merge commit, so a contractor PR can edit the workflow that reports its own results. Close that hole on the employer's side with repository **rulesets / required workflows** (the workflow comes from the base branch), a `pull_request_target` or `workflow_run` design that never executes PR-supplied workflow definitions, or a dedicated GitHub App `app_id` that publishes the check-run from outside the repository. GitEscrow cannot verify this configuration on-chain; it only guarantees that nothing but the named check-run from the named app counts.
+
+### Public Recovery (`thaw_milestone`)
+
+`thaw_milestone` is deliberately **permissionless**: anyone (employer, contractor, a third-party keeper or a bot) can call it. Its only effect is to move a `FROZEN_EXTERNAL_FAULT` milestone back to `PENDING` once a validator quorum confirms the repository is reachable again, granting a fresh 72h window and at least one fresh attempt. It never moves funds, never slashes, and reverts unless the milestone is frozen *and* the repo currently answers, so it cannot be used to grief either side. This exists so that an outage which resolves itself cannot leave a milestone stranded waiting for a specific party to notice: the recovery needs no cooperation from the contractor or the employer. If nobody thaws it, the 7-day `cancel_fault_free` exit still guarantees a terminal outcome.
+
 ### GitHub API rate limits near close deadlines
 
 Validators call the unauthenticated GitHub API (60 requests/hour/IP). A rate-limit 403 (header or body says so), 429, 5xx or unresolved 301 is classified `[TRANSIENT]`: the transaction reverts, **no attempt is consumed, and the contractor is never slashed for it**. But `claim_default`, `cancel_fault_free` and `accept_escrow` also need a successful probe, so an outage or rate-limit burst just delays them. Contractors should submit well before a deadline rather than in the last minutes, because a delivery that cannot be verified in time cannot be defended on-chain (the 72h window only starts after an overturned dispute).

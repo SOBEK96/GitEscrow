@@ -3,12 +3,12 @@
 import { Plus, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useBackend } from "@/lib/backend";
-import { DEFAULT_APP_ID, MAX_BOND_BPS, MAX_MILESTONES, MIN_BOND_BPS, bondFor } from "@/lib/rules";
+import { DEFAULT_APP_ID, MAX_BOND_BPS, MAX_DESCRIPTION_LEN, MAX_MILESTONES, MIN_BOND_BPS, bondFor, validateBaseline, validateRepositoryUrl } from "@/lib/rules";
 import { fmtGen, parseGen } from "@/lib/format";
 import type { MilestoneInput } from "@/lib/types";
 import { Field } from "./ui";
 
-interface Row { title: string; reward: string; tests: string; coverage: string; deadline: string; sha: string; check: string; app: string }
+interface Row { title: string; description: string; reward: string; tests: string; coverage: string; deadline: string; sha: string; check: string; app: string }
 
 const toLocalInput = (ts: number) => {
   const d = new Date(ts * 1000);
@@ -21,12 +21,13 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
   const realNow = Math.floor(Date.now() / 1000);
 
   const [contractor, setContractor] = useState("");
-  const [repo, setRepo] = useState("acme/widgets");
+  const [repositoryUrl, setRepositoryUrl] = useState("https://github.com/acme/widgets");
+  const [baseline, setBaseline] = useState("");
   const [branch, setBranch] = useState("main");
   const [title, setTitle] = useState("");
   const [bondPct, setBondPct] = useState(15);
   const [rows, setRows] = useState<Row[]>([
-    { title: "", reward: "100", tests: "50", coverage: "80", deadline: toLocalInput(realNow + 7 * 86400), sha: "", check: "ci/tests", app: String(DEFAULT_APP_ID) },
+    { title: "", description: "", reward: "100", tests: "50", coverage: "80", deadline: toLocalInput(realNow + 7 * 86400), sha: "", check: "ci/tests", app: String(DEFAULT_APP_ID) },
   ]);
 
   const totals = useMemo(() => {
@@ -41,10 +42,16 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
   const patch = (i: number, p: Partial<Row>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...p } : r)));
 
   async function submit() {
+    const urlError = validateRepositoryUrl(repositoryUrl) ?? validateBaseline(baseline);
+    if (urlError) { notify("err", urlError); return; }
+    if (rows.some((r) => !r.description.trim() || r.description.length > MAX_DESCRIPTION_LEN)) {
+      notify("err", `Every milestone needs a description of what must be delivered (1–${MAX_DESCRIPTION_LEN} characters)`); return;
+    }
     let milestones: MilestoneInput[];
     try {
       milestones = rows.map((r, i) => ({
         title: r.title.trim() || `Milestone ${i + 1}`,
+        description: r.description.trim(),
         reward: parseGen(r.reward),
         expectedSha: r.sha.trim().toLowerCase(),
         checkName: r.check.trim(),
@@ -55,7 +62,7 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
       }));
     } catch (e) { notify("err", e instanceof Error ? e.message : "Invalid milestone"); return; }
     const id = await run(() => backend.createEscrow(actorAddress, {
-      contractor: contractor.trim(), repo: repo.trim(), branch: branch.trim(), title: title.trim(), bondBps: bondPct * 100, milestones,
+      contractor: contractor.trim(), repositoryUrl: repositoryUrl.trim(), baselineCommitSha: baseline.trim().toLowerCase(), branch: branch.trim(), title: title.trim(), bondBps: bondPct * 100, milestones,
     }));
     if (id !== undefined) { notify("ok", `Escrow #${id} funded — waiting for the contractor's bond`); onCreated(id); }
   }
@@ -76,7 +83,8 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
           <Field label="Contractor address">
             <input className="input font-mono" value={contractor} onChange={(e) => setContractor(e.target.value)} placeholder="0x…" />
           </Field>
-          <Field label="Repository (owner/repo)"><input className="input font-mono" value={repo} onChange={(e) => setRepo(e.target.value)} /></Field>
+          <Field label="Repository URL" hint="Exactly https://github.com/<owner>/<repo> — deliveries are only accepted from this repository"><input className="input font-mono" value={repositoryUrl} onChange={(e) => setRepositoryUrl(e.target.value)} /></Field>
+          <Field label="Baseline commit SHA" hint="Full 40-hex commit the work starts from. Every delivery must be a strict descendant of it"><input className="input font-mono" value={baseline} onChange={(e) => setBaseline(e.target.value)} placeholder="40-hex" /></Field>
           <Field label="Target branch"><input className="input font-mono" value={branch} onChange={(e) => setBranch(e.target.value)} /></Field>
           <Field label={`Contractor performance bond · ${bondPct}% of each reward`} hint={`Allowed range ${MIN_BOND_BPS / 100}–${MAX_BOND_BPS / 100}%`}>
             <input type="range" min={MIN_BOND_BPS / 100} max={MAX_BOND_BPS / 100} step={1} value={bondPct} onChange={(e) => setBondPct(+e.target.value)} className="w-full accent-gl" />
@@ -86,7 +94,7 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
         <div className="mt-6 flex items-center justify-between">
           <span className="label">Milestones</span>
           <button className="btn-ghost !px-3 !py-1 text-xs" disabled={rows.length >= MAX_MILESTONES}
-            onClick={() => setRows((rs) => [...rs, { ...rs[rs.length - 1], title: "", sha: "" }])}><Plus size={13} /> Add</button>
+            onClick={() => setRows((rs) => [...rs, { ...rs[rs.length - 1], title: "", description: "", sha: "" }])}><Plus size={13} /> Add</button>
         </div>
         <div className="mt-2 space-y-3">
           {rows.map((r, i) => (
@@ -96,6 +104,7 @@ export function CreateEscrowModal({ actorAddress, onClose, onCreated }: { actorA
                 <div><Field label="Reward (GEN)"><input className="input font-mono" inputMode="decimal" value={r.reward} onChange={(e) => patch(i, { reward: e.target.value })} /></Field></div>
                 <div><Field label="Min tests"><input className="input font-mono" inputMode="numeric" value={r.tests} onChange={(e) => patch(i, { tests: e.target.value })} /></Field></div>
                 <div><Field label="Min branch cov. %"><input className="input font-mono" inputMode="decimal" value={r.coverage} onChange={(e) => patch(i, { coverage: e.target.value })} /></Field></div>
+                <div className="md:col-span-6"><Field label="Milestone description" hint="What must be built. Validators check the diff and the CI output against this text"><textarea className="input min-h-[64px]" maxLength={MAX_DESCRIPTION_LEN} value={r.description} onChange={(e) => patch(i, { description: e.target.value })} placeholder="Implement the streaming parser in src/parser.py with tests for malformed input" /></Field></div>
                 <div className="md:col-span-3"><Field label="Deadline"><input type="datetime-local" className="input" value={r.deadline} onChange={(e) => patch(i, { deadline: e.target.value })} /></Field></div>
                 <div className="md:col-span-3"><Field label="Attested check-run name" hint="CI check-run whose output carries the test / coverage / security numbers"><input className="input font-mono" value={r.check} onChange={(e) => patch(i, { check: e.target.value })} /></Field></div>
                 <div className="md:col-span-3"><Field label="Trusted GitHub App id" hint="15368 = GitHub Actions. Check-runs from any other app are ignored"><input className="input font-mono" inputMode="numeric" value={r.app} onChange={(e) => patch(i, { app: e.target.value })} /></Field></div>

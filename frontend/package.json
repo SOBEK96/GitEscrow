@@ -8,7 +8,7 @@
     "build": "next build",
     "start": "next start -p 3000",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test lib/rules.test.ts lib/wallet.test.ts"
+    "test": "tsx --test lib/rules.test.ts lib/wallet.test.ts lib/authorization.test.ts"
   },
   "dependencies": {
     "genlayer-js": "2.0.0-rc.1",

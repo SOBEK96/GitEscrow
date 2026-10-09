@@ -36,24 +36,30 @@ def seed_demo(c, address: str, contractor_addr: str) -> None:
     t = cm.now()
     demo = [
         ("SDK streaming transport grant", "genlayerlabs/genlayer-js", "main", 1500, [
-            ("Transport layer", 40, 60, 8500, t + 6 * DAY),
-            ("Reconnect & backoff", 30, 40, 8000, t + 12 * DAY),
+            ("Transport layer", "Add a streaming transport with reconnect-safe framing and unit tests.", 40, 60, 8500, t + 6 * DAY),
+            ("Reconnect & backoff", "Add exponential reconnect backoff with jitter and tests for dropped sockets.", 30, 40, 8000, t + 12 * DAY),
         ]),
         ("Vault invariants audit fixes", "acme/vault-audit", "release", 1000, [
-            ("Fix critical findings", 25, 120, 9000, t + 9 * DAY),
+            ("Fix critical findings", "Fix every critical finding from the audit report and add regression tests.", 25, 120, 9000, t + 9 * DAY),
         ]),
     ]
     for title, repo, branch, bps, miles in demo:
-        specs = [{"title": n, "reward": str(r * cm.ATTO // 10), "expected_sha": "", "check_name": "ci/tests", "app_id": 15368, "min_tests": tests,
-                  "min_coverage_bps": cov, "deadline": dl} for n, r, tests, cov, dl in miles]
+        try:
+            baseline = cm.github_head(repo, branch)
+        except Exception as exc:  # noqa: BLE001 - unauthenticated GitHub is rate limited / the demo repo may not exist
+            print(f"  skip '{title}': cannot resolve {repo}@{branch} baseline ({exc})")
+            continue
+        specs = [{"title": n, "description": desc, "reward": str(r * cm.ATTO // 10), "expected_sha": "", "check_name": "ci/tests",
+                  "app_id": 15368, "min_tests": tests, "min_coverage_bps": cov, "deadline": dl} for n, desc, r, tests, cov, dl in miles]
         total = sum(int(s["reward"]) for s in specs)
-        cm.send(c, address, "create_escrow", [contractor_addr, repo, branch, title, bps, json.dumps(specs)],
+        cm.send(c, address, "create_escrow",
+                [contractor_addr, f"https://github.com/{repo}", branch, title, bps, baseline, json.dumps(specs)],
                 value=total, label=f"create_escrow '{title}'")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--no-demo", action="store_true", help="skip seeding demo escrows")
+    ap.add_argument("--no-demo", action="store_true", help="skip seeding demo escrows (they need GitHub reachable for baseline lookup)")
     args = ap.parse_args()
 
     code = cm.CONTRACT_PATH.read_bytes()
@@ -68,7 +74,7 @@ def main() -> None:
     employer.initialize_consensus_smart_contract()
     fees = cm.retry(lambda: employer.estimate_transaction_fees())
     print("deploying contracts/git_escrow.py ...")
-    tx_hash = employer.deploy_contract(code=code, args=[], fees=fees)
+    tx_hash = employer.deploy_contract(code=code, args=[cm.SIGNING_CHAIN_ID], fees=fees)
     receipt = employer.wait_for_transaction_receipt(transaction_hash=tx_hash, wait_until="decided", retries=200, interval=3000)
     if not cm.is_success(receipt):
         raise SystemExit(f"Deployment failed: {receipt}")

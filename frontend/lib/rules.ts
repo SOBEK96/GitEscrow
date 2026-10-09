@@ -19,6 +19,21 @@ export const MAX_PENDING_POLLS = 20;
 export const DISPUTE_FEE_BPS = 300n;
 export const MIN_DISPUTE_FEE = ATTO / 50n;
 export const DEFAULT_APP_ID = 15368;
+export const MAX_DESCRIPTION_LEN = 1000;
+
+const REPO_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+const SHA_RE = /^[0-9a-f]{40}$/;
+
+/** Mirrors the contract's create_escrow validation so the form fails before a wallet prompt does. */
+export function validateRepositoryUrl(url: string): string | null {
+  const u = url.trim();
+  if (!REPO_URL_RE.test(u) || u.endsWith(".git")) return "Repository must be exactly https://github.com/<owner>/<repo>";
+  return null;
+}
+
+export function validateBaseline(sha: string): string | null {
+  return SHA_RE.test(sha.trim().toLowerCase()) ? null : "Baseline must be a full 40-character commit SHA";
+}
 
 export function bondFor(reward: bigint, bondBps: number): bigint {
   return (reward * BigInt(bondBps)) / BigInt(BPS);

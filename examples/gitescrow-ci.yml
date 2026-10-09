@@ -1,0 +1,53 @@
+# Template: a GitHub Actions workflow whose result GitEscrow validators can read.
+#
+# Validators do not trust a job's green tick. They read ONE check-run (name = the milestone's `check_name`,
+# created by the GitHub Actions app id 15368, executed against exactly the delivered commit) and parse
+# "N passed", "N failed", "Branch coverage: X%" and "Critical issues: N" from its output.
+#
+# Commit this file in the BASELINE commit. A delivery that adds, edits or deletes anything under .github/ is
+# rejected by the contract, so the contractor cannot change how CI reports.
+#
+# Replace the pytest / audit lines with your stack; keep the final "publish" step and the check name.
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pytest-cov pip-audit
+      - name: Run tests with branch coverage and a dependency audit
+        id: run
+        run: |
+          set +e
+          pytest -q --cov --cov-branch --cov-report=term > pytest.txt 2>&1
+          echo "pytest_exit=$?" >> "$GITHUB_OUTPUT"
+          passed=$(grep -oE '[0-9]+ passed' pytest.txt | tail -1 | grep -oE '[0-9]+'); passed=${passed:-0}
+          failed=$(grep -oE '[0-9]+ failed' pytest.txt | tail -1 | grep -oE '[0-9]+'); failed=${failed:-0}
+          cov=$(grep -E '^TOTAL' pytest.txt | grep -oE '[0-9]+(\.[0-9]+)?%' | tail -1 | tr -d '%'); cov=${cov:-0}
+          pip-audit -r requirements.txt > audit.txt 2>&1
+          critical=$(grep -ciE 'critical' audit.txt); critical=${critical:-0}
+          echo "summary=$passed passed, $failed failed. Branch coverage: ${cov}%. Critical issues: $critical" >> "$GITHUB_OUTPUT"
+      - name: Publish the check-run GitEscrow reads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SUMMARY: ${{ steps.run.outputs.summary }}
+          PYTEST_EXIT: ${{ steps.run.outputs.pytest_exit }}
+        run: |
+          conclusion=success; [ "$PYTEST_EXIT" = "0" ] || conclusion=failure
+          gh api "repos/${{ github.repository }}/check-runs" \
+            -f name='ci/tests' -f head_sha="$SHA" -f status=completed -f conclusion="$conclusion" \
+            -f 'output[title]=CI results' -f "output[summary]=$SUMMARY"

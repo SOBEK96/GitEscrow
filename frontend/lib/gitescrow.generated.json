@@ -1,10 +1,15 @@
 {
-  "address": "0x1A0Fb6315dc4289Ad24D79608650a9A360748EEA",
+  "address": "0x2F0186CF5CF4276409b4b4eF4b6525Ce474B096D",
   "chainId": 61997,
   "rpcUrl": "https://studio-next.genlayer.com/api",
   "abi": {
     "ctor": {
-      "params": [],
+      "params": [
+        [
+          "signing_chain_id",
+          "int"
+        ]
+      ],
       "kwparams": {}
     },
     "methods": {
@@ -25,12 +30,55 @@
           [
             "milestone_id",
             "int"
+          ],
+          [
+            "nonce",
+            "int"
+          ],
+          [
+            "expires_at",
+            "int"
+          ],
+          [
+            "signature",
+            "string"
           ]
         ],
         "kwparams": {},
         "readonly": false,
         "ret": "null",
         "payable": false
+      },
+      "authorization_message": {
+        "params": [
+          [
+            "action",
+            "string"
+          ],
+          [
+            "milestone_id",
+            "int"
+          ],
+          [
+            "commit_sha",
+            "string"
+          ],
+          [
+            "delivery_ref",
+            "string"
+          ],
+          [
+            "nonce",
+            "int"
+          ],
+          [
+            "expires_at",
+            "int"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "string"
       },
       "cancel_escrow": {
         "params": [
@@ -75,7 +123,7 @@
             "string"
           ],
           [
-            "repo",
+            "repository_url",
             "string"
           ],
           [
@@ -89,6 +137,10 @@
           [
             "bond_bps",
             "int"
+          ],
+          [
+            "baseline_commit_sha",
+            "string"
           ],
           [
             "milestones_json",
@@ -112,6 +164,18 @@
           ],
           [
             "delivery_ref",
+            "string"
+          ],
+          [
+            "nonce",
+            "int"
+          ],
+          [
+            "expires_at",
+            "int"
+          ],
+          [
+            "signature",
             "string"
           ]
         ],
@@ -154,6 +218,23 @@
             "int"
           ]
         ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "dict"
+      },
+      "get_nonce": {
+        "params": [
+          [
+            "who_hex",
+            "string"
+          ]
+        ],
+        "kwparams": {},
+        "readonly": true,
+        "ret": "int"
+      },
+      "get_signing_domain": {
+        "params": [],
         "kwparams": {},
         "readonly": true,
         "ret": "dict"

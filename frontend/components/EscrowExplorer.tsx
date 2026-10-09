@@ -31,7 +31,7 @@ export function EscrowExplorer({ selected, onSelect, onCreate }: { selected: num
 }
 
 function Row({ e, active, onClick }: { e: Escrow; active: boolean; onClick(): void }) {
-  const done = e.milestones.filter((m) => m.status === "RELEASED").length;
+  const done = e.milestones.filter((m) => m.status === "FINALIZED").length;
   return (
     <button onClick={onClick} aria-pressed={active}
       className={`block w-full rounded-xl p-3 text-left ring-1 transition ${active ? "bg-gl/10 ring-gl/50" : "bg-ink-850 ring-white/5 hover:ring-white/15"}`}>
@@ -44,7 +44,7 @@ function Row({ e, active, onClick }: { e: Escrow; active: boolean; onClick(): vo
       </div>
       <div className="mt-3 flex gap-1">
         {e.milestones.map((m) => (
-          <span key={m.id} className={`h-1.5 flex-1 rounded-full ${m.status === "RELEASED" ? "bg-ok" : m.status === "VERIFIED" ? "bg-ok/50" : m.status === "DEFAULTED" ? "bg-bad" : "bg-ink-600"}`} />
+          <span key={m.id} className={`h-1.5 flex-1 rounded-full ${m.status === "FINALIZED" ? "bg-ok" : m.status === "SUBMITTED" ? "bg-ok/50" : m.status === "DEFAULTED" ? "bg-bad" : "bg-ink-600"}`} />
         ))}
       </div>
       <div className="mt-2 flex items-center justify-between text-[11px] text-zinc-500">

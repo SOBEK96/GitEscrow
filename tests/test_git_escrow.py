@@ -11,8 +11,10 @@ import json
 import pytest
 
 from conftest import (
-    ATTO, BOND, BOND_BPS, CHECK, CONTRACT, DAY, HOUR, OTHER_SHA, REPO, REPO_ID, REWARD, SHA, T0,
-    accept, active_escrow, as_, create, fund, good_report, hx, iso, milestone_spec, mock_github, mock_repo,
+    ADDR, ATTO, BASELINE, BOND, BOND_BPS, CHECK, CONTRACT, DAY, HOUR, KEYS, OTHER_SHA, REPO, REPO_ID, REPO_URL,
+    REWARD, SHA, SIGNING_CHAIN_ID, T0,
+    accept, active_escrow, approve, as_, auth_message, contract_hex, create, fund, good_report, hx, iso,
+    milestone_spec, mock_baseline, mock_github, mock_repo, now_ts, personal_sign, signed_args, submit,
 )
 
 FEE = max(ATTO // 50, REWARD * 300 // 10_000)  # 3% of 100 GEN
@@ -20,14 +22,14 @@ DISPUTE_BOND_1 = REWARD * 100 // 10_000  # 1% of 100 GEN
 
 
 @pytest.fixture
-def world(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
-    c = direct_deploy(CONTRACT)
-    return c, direct_vm, direct_alice, direct_bob, direct_charlie
+def world(direct_vm, direct_deploy):
+    c = direct_deploy(CONTRACT, SIGNING_CHAIN_ID)
+    return c, direct_vm, ADDR["alice"], ADDR["bob"], ADDR["charlie"]
 
 
 def deliver(c, vm, contractor, mid=1, sha=SHA, ref=""):
     as_(vm, contractor)
-    return c.evaluate_milestone_delivery(mid, sha, ref)
+    return submit(c, vm, mid, sha, ref)
 
 
 def dispute(c, vm, employer, mid=1, reason="evidence changed", bond=None):
@@ -83,7 +85,7 @@ class TestDepositAndStaking:
         fund(vm, alice)
         as_(vm, alice, REWARD - 1)
         with vm.expect_revert("msg.value must equal"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec()]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec()]))
 
     @pytest.mark.parametrize("bps", [999, 2001, 0, 10_000])
     def test_bond_bps_bounds(self, world, bps):
@@ -91,7 +93,7 @@ class TestDepositAndStaking:
         fund(vm, alice)
         as_(vm, alice, REWARD)
         with vm.expect_revert("bond_bps"):
-            c.create_escrow(hx(bob), REPO, "main", "t", bps, json.dumps([milestone_spec()]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", bps, BASELINE, json.dumps([milestone_spec()]))
 
     @pytest.mark.parametrize("bps", [1000, 1500, 2000])
     def test_bond_bps_edges_accepted(self, world, bps):
@@ -105,36 +107,41 @@ class TestDepositAndStaking:
         as_(vm, alice, REWARD)
         good = json.dumps([milestone_spec()])
         with vm.expect_revert("differ"):
-            c.create_escrow(hx(alice), REPO, "main", "t", 1500, good)
-        with vm.expect_revert("owner/repo"):
-            c.create_escrow(hx(bob), "not-a-repo", "main", "t", 1500, good)
-        with vm.expect_revert("owner/repo"):
-            c.create_escrow(hx(bob), "a/b/../c", "main", "t", 1500, good)
+            c.create_escrow(hx(alice), REPO_URL, "main", "t", 1500, BASELINE, good)
+        for bad_url in ("not-a-repo", "acme/widgets", "https://github.com/a/b/../c", f"{REPO_URL}.git", f"{REPO_URL}/",
+                        "http://github.com/acme/widgets", "https://gitlab.com/acme/widgets"):
+            with vm.expect_revert("repository_url"):
+                c.create_escrow(hx(bob), bad_url, "main", "t", 1500, BASELINE, good)
+        for bad_sha in ("", "abc", "G" * 40, "c" * 39):
+            with vm.expect_revert("baseline_commit_sha"):
+                c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, bad_sha, good)
+        with vm.expect_revert("description"):
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(description="")]))
         with vm.expect_revert("branch"):
-            c.create_escrow(hx(bob), REPO, "a..b", "t", 1500, good)
+            c.create_escrow(hx(bob), REPO_URL, "a..b", "t", 1500, BASELINE, good)
         with vm.expect_revert("milestones"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, "[]")
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, "[]")
         with vm.expect_revert("milestones"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, "not json")
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, "not json")
         with vm.expect_revert("expected_sha"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec(expected_sha="abc")]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(expected_sha="abc")]))
         with vm.expect_revert("deadline"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec(deadline=T0 - 1)]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(deadline=T0 - 1)]))
         with vm.expect_revert("threshold"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec(min_coverage_bps=10_001)]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(min_coverage_bps=10_001)]))
         with vm.expect_revert("reward"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec(reward=0)]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(reward=0)]))
         with vm.expect_revert("check_name"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec(check_name="")]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(check_name="")]))
         with vm.expect_revert("app_id"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec(app_id=0)]))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec(app_id=0)]))
 
     def test_too_many_milestones(self, world):
         c, vm, alice, bob, _ = world
         fund(vm, alice)
         as_(vm, alice, REWARD * 11)
         with vm.expect_revert("milestones"):
-            c.create_escrow(hx(bob), REPO, "main", "t", 1500, json.dumps([milestone_spec()] * 11))
+            c.create_escrow(hx(bob), REPO_URL, "main", "t", 1500, BASELINE, json.dumps([milestone_spec()] * 11))
 
     def test_accept_requires_exact_bond_and_contractor(self, world):
         c, vm, alice, bob, charlie = world
@@ -179,6 +186,7 @@ class TestDepositAndStaking:
         fund(vm, bob)
         vm.clear_mocks()
         mock_repo(vm, redirect=True, full_name="acme/widgets-renamed")
+        mock_baseline(vm, repo="acme/widgets-renamed")
         as_(vm, bob, BOND)
         c.accept_escrow(eid)
         assert c.get_escrow(eid)["repo_id"] == REPO_ID
@@ -230,7 +238,7 @@ class TestSuccessfulDelivery:
         assert report["report_present"] and not report["report_mismatch"]
         c = world[0]
         m = c.get_milestone(1)
-        assert m["status"] == "VERIFIED"
+        assert m["status"] == "SUBMITTED"
         assert m["release_at"] == T0 + 48 * HOUR
         assert json.loads(m["last_report"])["passed"] is True
 
@@ -246,24 +254,24 @@ class TestSuccessfulDelivery:
             c.settle_milestone(1)
         vm.warp(iso(T0 + 48 * HOUR))
         c.settle_milestone(1)  # anyone may settle
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        assert c.get_milestone(1)["status"] == "FINALIZED"
         assert c.get_escrow(1)["status"] == "CLOSED"
         s = solvent(c)
         assert s["total_paid_out"] == REWARD + BOND  # reward + own bond back
         assert s["liabilities"] == 0
         assert c.get_stats()["total_released"] == REWARD
-        with vm.expect_revert("not verified"):
+        with vm.expect_revert("already finalized"):
             c.settle_milestone(1)
 
     def test_employer_can_release_instantly(self, world):
         c, vm, alice, bob, charlie = world
         verified(world)
         as_(vm, charlie)
-        with vm.expect_revert("only the employer"):
-            c.approve_milestone(1)
+        with vm.expect_revert("signature does not match"):
+            approve(c, vm, 1)  # charlie's wallet is not the employer
         as_(vm, alice)
-        c.approve_milestone(1)
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        approve(c, vm, 1)
+        assert c.get_milestone(1)["status"] == "FINALIZED"
         assert solvent(c)["total_paid_out"] == REWARD + BOND
 
     def test_multi_milestone_progress(self, world):
@@ -273,13 +281,13 @@ class TestSuccessfulDelivery:
         mock_github(vm)
         deliver(c, vm, bob, 1)
         as_(vm, alice)
-        c.approve_milestone(1)
+        approve(c, vm, 1)
         esc = c.get_escrow(1)
         assert esc["status"] == "ACTIVE" and esc["open_milestones"] == 1
-        assert [m["status"] for m in esc["milestones"]] == ["RELEASED", "PENDING"]
+        assert [m["status"] for m in esc["milestones"]] == ["FINALIZED", "FUNDED"]
         deliver(c, vm, bob, 2)
         as_(vm, alice)
-        c.approve_milestone(2)
+        approve(c, vm, 2)
         assert c.get_escrow(1)["status"] == "CLOSED"
         assert c.get_stats()["active_escrows"] == 0
         solvent(c)
@@ -305,7 +313,7 @@ class TestSuccessfulDelivery:
         active_escrow(c, vm, alice, bob)
         mock_github(vm)
         for who in (alice, charlie):
-            with vm.expect_revert("only the contractor"):
+            with vm.expect_revert("signature does not match"):
                 deliver(c, vm, who)
 
     def test_sha_must_be_full_hex(self, world):
@@ -336,7 +344,7 @@ class TestFailedDelivery:
         c, vm, _, bob, _ = world
         mock_github(vm, **mock)
         r = deliver(c, vm, bob)
-        assert r["passed"] is False and c.get_milestone(1)["status"] == "PENDING"  # retry stays possible
+        assert r["passed"] is False and c.get_milestone(1)["status"] == "FUNDED"  # retry stays possible
         return r
 
     def test_insufficient_test_count(self, world):
@@ -352,8 +360,10 @@ class TestFailedDelivery:
         assert self.attempt(world, critical=1)["failures"] == ["critical_findings"]
 
     def test_missing_commit(self, world):
-        r = self.attempt(world, exists=False)
-        assert r["failures"] == ["commit_not_found"] and not r["commit_exists"]
+        c, vm, _, bob, _ = world
+        with vm.expect_revert("commit_not_found"):
+            self.attempt(world, exists=False)
+        assert c.get_milestone(1)["attempts"] == 0
 
     def test_commit_not_on_target_branch(self, world):
         assert self.attempt(world, on_branch=False)["failures"] == ["commit_not_on_ref"]
@@ -366,7 +376,10 @@ class TestFailedDelivery:
         assert r["failures"] == ["ci_attestation_missing"]
 
     def test_spoofed_commit_payload_from_other_repository(self, world):
-        assert "spoofed_payload" in self.attempt(world, commit_url_repo="evil/fork")["failures"]
+        c, vm, _, bob, _ = world
+        with vm.expect_revert("spoofed_payload"):
+            self.attempt(world, commit_url_repo="evil/fork")
+        assert c.get_milestone(1)["attempts"] == 0
 
     def test_unattested_security_evidence_fails_closed(self, world):
         r = self.attempt(world, report=None, check_text="all good!")
@@ -394,7 +407,7 @@ class TestFailedDelivery:
         assert not deliver(c, vm, bob)["passed"]
         mock_github(vm)
         assert deliver(c, vm, bob)["passed"]
-        assert c.get_milestone(1)["status"] == "VERIFIED"
+        assert c.get_milestone(1)["status"] == "SUBMITTED"
 
 
 # ========================= PoC 2: forged / self-authored report.json spoofing
@@ -408,30 +421,35 @@ class TestAttestedCheckRun:
         c, vm, _, bob, _ = world
         forged = good_report(tests_passed=5000, branch_coverage=99.0)
         mock_github(vm, tests=12, coverage=99.0, report=forged)
-        r = deliver(c, vm, bob)
-        assert r["passed"] is False
-        assert "SPOOFED_REPORT_PAYLOAD" in r["failures"]
-        assert r["tests_passed"] == 12  # the forged 5000 never enters the verdict
-        assert c.get_milestone(1)["status"] == "PENDING"
+        with vm.expect_revert("SPOOFED_REPORT_PAYLOAD"):  # a forged report is a provenance violation: it reverts
+            deliver(c, vm, bob)
+        m = c.get_milestone(1)
+        assert m["status"] == "FUNDED" and m["attempts"] == 0 and m["last_report"] == ""
 
     def test_report_cannot_substitute_a_missing_check_run(self, world):
         c, vm, _, bob, _ = world
         mock_github(vm, ci="absent", report=good_report())
+        with vm.expect_revert("SPOOFED_REPORT_PAYLOAD"):
+            deliver(c, vm, bob)
+        mock_github(vm, ci="absent", report=None)
         r = deliver(c, vm, bob)
         assert not r["passed"] and "ci_attestation_missing" in r["failures"]
 
     def test_report_cannot_override_failing_ci(self, world):
         c, vm, _, bob, _ = world
         mock_github(vm, ci="failure", tests=3, report=good_report())
+        with vm.expect_revert("SPOOFED_REPORT_PAYLOAD"):
+            deliver(c, vm, bob)
+        mock_github(vm, ci="failure", tests=3, report=None)
         r = deliver(c, vm, bob)
-        assert not r["passed"]
-        assert {"ci_failed", "tests_below_minimum", "SPOOFED_REPORT_PAYLOAD"} <= set(r["failures"])
+        assert not r["passed"] and {"ci_failed", "tests_below_minimum"} <= set(r["failures"])
 
     def test_report_for_other_commit_or_repository_is_spoofed(self, world):
         c, vm, _, bob, _ = world
         for bad in (good_report(sha=OTHER_SHA), good_report(repo="evil/fork"), ["not", "a", "dict"]):
             mock_github(vm, report=bad)
-            assert "SPOOFED_REPORT_PAYLOAD" in deliver(c, vm, bob)["failures"]
+            with vm.expect_revert("SPOOFED_REPORT_PAYLOAD"):
+                deliver(c, vm, bob)
 
     def test_matching_report_corroborates(self, world):
         c, vm, _, bob, _ = world
@@ -442,7 +460,8 @@ class TestAttestedCheckRun:
     def test_report_claiming_an_unknown_metric_the_check_run_lacks_is_a_mismatch(self, world):
         c, vm, _, bob, _ = world
         mock_github(vm, check_text="120 passed, 0 failed.", report=good_report())
-        assert "SPOOFED_REPORT_PAYLOAD" in deliver(c, vm, bob)["failures"]
+        with vm.expect_revert("SPOOFED_REPORT_PAYLOAD"):
+            deliver(c, vm, bob)
 
     def test_check_run_from_the_wrong_app_is_ignored(self, world):
         c, vm, _, bob, _ = world
@@ -544,7 +563,7 @@ class TestDisputes:
             mock_github(vm, tests=1)  # evidence now fails
             out = dispute(c, vm, alice, reason=f"force-pushed {n}")
             assert out["dispute_outcome"] == "DELIVERY_OVERTURNED"
-            assert c.get_milestone(1)["status"] == "PENDING"
+            assert c.get_milestone(1)["status"] == "DISPUTED"
             assert c.get_milestone(1)["dispute_count"] == n + 1
             mock_github(vm)
             deliver(c, vm, bob)
@@ -577,7 +596,7 @@ class TestDisputes:
         mock_github(vm)  # evidence unchanged: dispute is frivolous
         out = dispute(c, vm, alice, reason="I just do not like it")
         assert out["dispute_outcome"] == "UPHELD_DELIVERY"
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        assert c.get_milestone(1)["status"] == "FINALIZED"
         s = solvent(c)
         assert s["total_paid_out"] == REWARD + BOND + bond  # contractor is compensated with the bond
         assert s["fees_retained"] == FEE  # the fee is never paid back to anyone
@@ -605,7 +624,7 @@ class TestDisputes:
         assert out["dispute_outcome"] == "DELIVERY_OVERTURNED"
         assert "ci_failed" in out["failures"]
         m = c.get_milestone(1)
-        assert m["status"] == "PENDING" and m["release_at"] == 0
+        assert m["status"] == "DISPUTED" and m["release_at"] == 0
         s = solvent(c)
         assert s["total_paid_out"] == bond  # only the bond comes back
         assert s["fees_retained"] == FEE
@@ -642,7 +661,7 @@ class TestDisputes:
         as_(vm, alice, need)
         with vm.expect_revert("CI is re-running"):
             c.file_dispute(1, "rerun")
-        assert c.get_milestone(1)["status"] == "VERIFIED"
+        assert c.get_milestone(1)["status"] == "SUBMITTED"
 
     def test_dispute_cannot_be_won_by_hiding_the_repository(self, world):
         c, vm, alice, bob, _ = world
@@ -652,10 +671,10 @@ class TestDisputes:
         as_(vm, alice, need)
         with vm.expect_revert("repository is unreachable"):
             c.file_dispute(1, "deleted the repo")
-        assert c.get_milestone(1)["status"] == "VERIFIED"
+        assert c.get_milestone(1)["status"] == "SUBMITTED"
         vm.warp(iso(T0 + 48 * HOUR))
         c.settle_milestone(1)  # the contractor is still paid
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        assert c.get_milestone(1)["status"] == "FINALIZED"
 
 
 # ========= PoC 1: overturned delivery after the deadline must not be harvestable
@@ -679,7 +698,7 @@ class TestResubmitWindow:
         assert out["dispute_outcome"] == "DELIVERY_OVERTURNED"
 
         m = c.get_milestone(1)
-        assert m["status"] == "PENDING" and m["attempts"] == 0
+        assert m["status"] == "DISPUTED" and m["attempts"] == 0
         assert old_deadline < t  # the original deadline really was behind us
         assert m["deadline"] == t + 72 * HOUR
         assert m["resubmit_until"] == t + 72 * HOUR
@@ -698,8 +717,8 @@ class TestResubmitWindow:
         mock_github(vm)
         assert deliver(c, vm, bob)["passed"]
         as_(vm, alice)
-        c.approve_milestone(1)
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        approve(c, vm, 1)
+        assert c.get_milestone(1)["status"] == "FINALIZED"
         s = solvent(c)
         assert c.get_stats()["total_slashed"] == 0
         assert s["fees_retained"] == FEE
@@ -749,6 +768,7 @@ class TestExternalFaults:
         fund(vm, bob)
         vm.clear_mocks()
         mock_repo(vm, redirect=True, full_name="acme/widgets-renamed")
+        mock_baseline(vm, repo="acme/widgets-renamed")
         as_(vm, bob, BOND)
         c.accept_escrow(eid)
         mock_github(vm, full_name="acme/widgets-renamed")
@@ -833,7 +853,7 @@ class TestExternalFaults:
         r = deliver(c, vm, bob)
         assert r["passed"]
         m = c.get_milestone(1)
-        assert m["status"] == "VERIFIED" and m["consent_mask"] == 0 and m["frozen_at"] == 0
+        assert m["status"] == "SUBMITTED" and m["consent_mask"] == 0 and m["frozen_at"] == 0
         assert m["deadline"] == T0 + 9 * DAY + 72 * HOUR  # compensated for the outage
         solvent(c)
 
@@ -853,7 +873,7 @@ class TestExternalFaults:
             with vm.expect_revert("[TRANSIENT]"):
                 deliver(c, vm, bob)
         m = c.get_milestone(1)
-        assert m["attempts"] == 0 and m["status"] == "PENDING"
+        assert m["attempts"] == 0 and m["status"] == "FUNDED"
 
     def test_unresolvable_301_is_transient(self, world):
         c, vm, alice, bob, _ = world
@@ -950,8 +970,8 @@ class TestValidatorConsensus:
     def test_validators_agree_on_failure_verdicts(self, world):
         c, vm, alice, bob, _ = world
         active_escrow(c, vm, alice, bob)
-        mock_github(vm, exists=False)
-        deliver(c, vm, bob)
+        mock_github(vm, tests=3)  # an ordinary recorded failure: validators re-derive the same verdict
+        assert deliver(c, vm, bob)["failures"] == ["tests_below_minimum"]
         assert vm.run_validator() is True
 
     def test_validators_must_agree_the_repository_is_gone(self, world):
@@ -973,7 +993,7 @@ class TestDisputeInvariance:
         out = dispute(c, vm, alice, reason="force-pushed main, delivered commit is gone from history")
         assert out["dispute_outcome"] == "UPHELD_DELIVERY"
         assert out["ref_checked"] is False and out["passed"] is True
-        assert c.get_milestone(1)["status"] == "RELEASED"  # payout proceeds
+        assert c.get_milestone(1)["status"] == "FINALIZED"  # payout proceeds
         s = solvent(c)
         assert s["total_paid_out"] > REWARD + BOND  # contractor also receives the forfeited dispute bond
         assert c.get_stats()["total_released"] == REWARD and s["fees_retained"] == FEE
@@ -984,7 +1004,7 @@ class TestDisputeInvariance:
         mock_github(vm, compare_http=404, on_branch=False)  # compare against the deleted branch 404s
         out = dispute(c, vm, alice, reason="deleted the branch")
         assert out["dispute_outcome"] == "UPHELD_DELIVERY"
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        assert c.get_milestone(1)["status"] == "FINALIZED"
 
     def test_rerun_of_the_check_cannot_overturn_because_the_dispute_is_pinned(self, world):
         c, vm, alice, bob, _ = world
@@ -995,7 +1015,7 @@ class TestDisputeInvariance:
         mock_github(vm, decoys=[newer_failure], report=None)  # genuine run 101 still present and green
         out = dispute(c, vm, alice, reason="re-ran CI and it failed")
         assert out["dispute_outcome"] == "UPHELD_DELIVERY"
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        assert c.get_milestone(1)["status"] == "FINALIZED"
 
     def test_pinned_check_run_that_disappears_overturns(self, world):
         c, vm, alice, bob, _ = world
@@ -1033,7 +1053,7 @@ class TestDeliveryRef:
         r = deliver(c, vm, bob, ref="pull/7")
         assert r["passed"] and r["on_ref"] and r["delivery_ref"] == "pull/7"
         m = c.get_milestone(1)
-        assert m["status"] == "VERIFIED" and m["delivery_ref"] == "pull/7" and m["check_run_id"] == 101
+        assert m["status"] == "SUBMITTED" and m["delivery_ref"] == "pull/7" and m["check_run_id"] == 101
 
     def test_the_same_commit_fails_against_the_target_branch_alone(self, world):
         c, vm, _, bob, _ = world
@@ -1101,14 +1121,14 @@ class TestFrozenNeverDeadlocks:
         mock_github(vm)  # the repository is public again
         as_(vm, charlie)
         out = c.thaw_milestone(1)  # anyone may thaw
-        assert out["outcome"] == "PENDING"
+        assert out["outcome"] == "FUNDED"
         m = c.get_milestone(1)
-        assert m["status"] == "PENDING" and m["attempts"] == 4  # at least one fresh attempt
+        assert m["status"] == "FUNDED" and m["attempts"] == 4  # at least one fresh attempt
         assert m["deadline"] == T0 + 8 * DAY + 72 * HOUR
         assert deliver(c, vm, bob)["passed"]
         as_(vm, alice)
-        c.approve_milestone(1)
-        assert c.get_milestone(1)["status"] == "RELEASED"
+        approve(c, vm, 1)
+        assert c.get_milestone(1)["status"] == "FINALIZED"
         solvent(c)
 
     def test_exhausted_attempts_then_public_then_evaluate_revives_directly(self, world):
@@ -1117,7 +1137,7 @@ class TestFrozenNeverDeadlocks:
         mock_github(vm)
         r = deliver(c, vm, bob)  # evaluate on a frozen milestone bypasses the spent attempt cap
         assert r["passed"]
-        assert c.get_milestone(1)["status"] == "VERIFIED"
+        assert c.get_milestone(1)["status"] == "SUBMITTED"
 
     def test_unilateral_cancel_after_cooldown_even_though_the_repo_is_back(self, world):
         c, vm, alice, bob, _ = world
@@ -1142,7 +1162,7 @@ class TestFrozenNeverDeadlocks:
         with vm.expect_revert("thaw_milestone"):
             c.cancel_fault_free(1)
         c.thaw_milestone(1)
-        assert c.get_milestone(1)["status"] == "PENDING"
+        assert c.get_milestone(1)["status"] == "FUNDED"
 
     def test_deadline_elapsed_unlocks_the_unilateral_cancel(self, world):
         c, vm, alice, bob, _ = world

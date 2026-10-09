@@ -48,7 +48,7 @@ export function SettlementTerminal({ escrow, m, actorAddress, onOutcome }: { esc
             </Box>
           )}
 
-          {escrow.status === "ACTIVE" && m.status === "PENDING" && (
+          {escrow.status === "ACTIVE" && (m.status === "FUNDED" || m.status === "DISPUTED") && (
             <Box icon={<Hourglass size={15} />} title="Delivery deadline" tone={deadlineLeft <= 0 ? "bad" : undefined}>
               <div className="font-mono text-3xl font-semibold tabular-nums">{deadlineLeft > 0 ? fmtDuration(deadlineLeft) : "EXPIRED"}</div>
               <p className="mt-2 text-xs text-zinc-500">
@@ -84,7 +84,7 @@ export function SettlementTerminal({ escrow, m, actorAddress, onOutcome }: { esc
             </Box>
           )}
 
-          {m.status === "VERIFIED" && (
+          {m.status === "SUBMITTED" && (
             <Box icon={<Unlock size={15} />} title="48h dispute grace period" tone="ok">
               <div className="font-mono text-3xl font-semibold tabular-nums">{windowLeft > 0 ? fmtDuration(windowLeft) : "OPEN FOR SETTLEMENT"}</div>
               <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-ink-700">
@@ -95,12 +95,12 @@ export function SettlementTerminal({ escrow, m, actorAddress, onOutcome }: { esc
                 <button className="btn-primary" disabled={windowLeft > 0 || busy}
                   onClick={() => run(() => backend.settle(actorAddress, m.id)).then(() => notify("ok", "Milestone settled — payout released"))}>Claim settlement</button>
                 <button className="btn-ghost" disabled={!isEmployer || busy}
-                  onClick={() => run(() => backend.approve(actorAddress, m.id)).then(() => notify("ok", "Employer approved — instant release"))}>Approve now (waive window)</button>
+                  onClick={() => run(() => backend.approve(actorAddress, m.id)).then(() => notify("ok", "Employer approved — instant finalization"))}>Sign & approve now (waive window)</button>
               </div>
             </Box>
           )}
 
-          {m.status === "RELEASED" && <Done tone="ok" text={`Released. ${fmtGen(m.reward + m.bond)} GEN paid to the contractor (reward + returned bond).`} />}
+          {m.status === "FINALIZED" && <Done tone="ok" text={`Finalized. ${fmtGen(m.paidOut)} GEN paid to the contractor (reward + returned bond${m.paidOut > m.reward + m.bond ? " + forfeited dispute bond" : ""}). The contract now holds ${fmtGen(m.escrowed)} GEN for this milestone and it can never be paid again.`} />}
           {m.status === "DEFAULTED" && <Done tone="bad" text={`Defaulted. ${fmtGen(m.reward + m.bond)} GEN returned to the employer — ${fmtGen(m.bond)} GEN of it slashed from the contractor.`} />}
           {m.status === "CANCELLED_FAULT_FREE" && <Done tone="muted" text={`Cancelled fault-free. ${fmtGen(m.reward)} GEN refunded to the employer and the ${fmtGen(m.bond)} GEN bond returned intact to the contractor.`} />}
           {m.status === "CANCELLED" && <Done tone="muted" text="Escrow cancelled before bonding. Deposit refunded." />}
@@ -133,8 +133,8 @@ export function SettlementTerminal({ escrow, m, actorAddress, onOutcome }: { esc
             max(0.1 GEN, 1% of reward) × 2<sup>disputes + lost-dispute strikes</sup>. The fee (3% of the reward) is burned either way. A fresh quorum re-verifies the commit: if the delivery holds, your bond goes to the contractor; if it was invalidated (e.g. force-push), the bond is refunded and the contractor gets a fresh 72h window to resubmit.
           </p>
           <textarea className="input mt-3 min-h-[64px]" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500}
-            placeholder="Why should the delivery be invalid?" aria-label="Dispute reason" disabled={m.status !== "VERIFIED" || !isEmployer} />
-          <button className="btn-danger mt-3 w-full" disabled={m.status !== "VERIFIED" || !isEmployer || windowLeft <= 0 || !reason.trim() || busy || m.disputeCount >= MAX_DISPUTES}
+            placeholder="Why should the delivery be invalid?" aria-label="Dispute reason" disabled={m.status !== "SUBMITTED" || !isEmployer} />
+          <button className="btn-danger mt-3 w-full" disabled={m.status !== "SUBMITTED" || !isEmployer || windowLeft <= 0 || !reason.trim() || busy || m.disputeCount >= MAX_DISPUTES}
             onClick={async () => {
               const out = await run(() => backend.fileDispute(actorAddress, m.id, reason.trim()));
               if (out) { onOutcome(out); setReason(""); notify(out.report.dispute_outcome === "UPHELD_DELIVERY" ? "err" : "ok",
@@ -142,8 +142,8 @@ export function SettlementTerminal({ escrow, m, actorAddress, onOutcome }: { esc
             }}>
             File dispute · pay {cost !== null ? fmtGen(cost, 3) : "—"} GEN
           </button>
-          {m.status !== "VERIFIED" && <p className="mt-2 text-[11px] text-zinc-600">Disputes open once a delivery is verified, and close when the 48h window ends.</p>}
-          {m.status === "VERIFIED" && !isEmployer && <p className="mt-2 text-[11px] text-zinc-600">Only the employer can dispute.</p>}
+          {m.status !== "SUBMITTED" && <p className="mt-2 text-[11px] text-zinc-600">Disputes open once a delivery is verified, and close when the 48h window ends.</p>}
+          {m.status === "SUBMITTED" && !isEmployer && <p className="mt-2 text-[11px] text-zinc-600">Only the employer can dispute.</p>}
         </Box>
       </div>
     </Section>

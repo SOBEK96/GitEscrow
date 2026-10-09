@@ -2,7 +2,7 @@
 
 export type EscrowStatus = "OPEN" | "ACTIVE" | "CLOSED" | "CANCELLED";
 export type MilestoneStatus =
-  | "PENDING" | "VERIFIED" | "RELEASED" | "DEFAULTED" | "CANCELLED"
+  | "FUNDED" | "SUBMITTED" | "FINALIZED" | "DISPUTED" | "DEFAULTED" | "CANCELLED"
   | "FROZEN_EXTERNAL_FAULT" | "CANCELLED_FAULT_FREE";
 
 export type CiState = "success" | "failure" | "pending" | "none";
@@ -17,6 +17,17 @@ export interface Report {
   repo_match: boolean;
   on_ref: boolean;
   ref_checked?: boolean;
+  descends_from_baseline?: boolean;
+  ci_config_tampered?: boolean;
+  tests_removed?: boolean;
+  rigged_tests?: boolean;
+  diff_too_large?: boolean;
+  diff_findings?: string[];
+  changed_files?: number;
+  review_done?: boolean;
+  review_implements?: boolean;
+  review_provenance?: boolean;
+  review_reason?: string;
   delivery_ref?: string;
   check_run_id?: number;
   ci_state: CiState;
@@ -39,8 +50,13 @@ export interface Milestone {
   escrowId: number;
   index: number;
   title: string;
+  description: string;
   reward: bigint;
   bond: bigint;
+  /** Wei the contract still holds for this milestone; exactly 0 once it is paid out or otherwise terminal. */
+  escrowed: bigint;
+  paidOut: bigint;
+  finalizedAt: number;
   expectedSha: string;
   checkName: string;
   appId: number;
@@ -69,6 +85,8 @@ export interface Escrow {
   employer: string;
   contractor: string;
   repo: string;
+  repositoryUrl: string;
+  baselineCommitSha: string;
   repoId: number;
   branch: string;
   title: string;
@@ -128,6 +146,7 @@ export interface Outcome {
 
 export interface MilestoneInput {
   title: string;
+  description: string;
   reward: bigint;
   expectedSha: string;
   checkName: string;
@@ -139,7 +158,10 @@ export interface MilestoneInput {
 
 export interface CreateEscrowInput {
   contractor: string;
-  repo: string;
+  /** Exactly https://github.com/<owner>/<repo> */
+  repositoryUrl: string;
+  /** Full 40-hex commit every delivery must strictly descend from. */
+  baselineCommitSha: string;
   branch: string;
   title: string;
   bondBps: number;

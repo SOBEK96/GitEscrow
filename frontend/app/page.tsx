@@ -26,7 +26,7 @@ function Dashboard() {
   const milestone = useMemo(() => {
     if (!escrow) return null;
     return escrow.milestones.find((m) => m.id === milestoneId)
-      ?? escrow.milestones.find((m) => m.status === "VERIFIED" || m.status === "PENDING")
+      ?? escrow.milestones.find((m) => m.status === "SUBMITTED" || m.status === "FUNDED" || m.status === "DISPUTED")
       ?? escrow.milestones[0];
   }, [escrow, milestoneId]);
 

@@ -2,11 +2,11 @@
 
 **Autonomous, code-verifiable milestone escrow on [GenLayer](https://genlayer.com).**
 
-An employer locks milestone rewards in GEN. A contractor stakes a 10-20% performance bond. When the contractor submits a GitHub commit, a quorum of GenVM validators **independently** inspects it - does the commit exist, is it on the target branch, is CI green, how many tests pass, what is the branch coverage, are there critical findings - and the contract pays out, or doesn't, based on that verdict. No multisig, no arbiter, no "client went silent".
+An employer locks milestone rewards in GEN and pins the exact `repository_url` and a `baseline_commit_sha`. A contractor stakes a 10-20% performance bond. When the contractor submits a GitHub commit (signed with their wallet), a quorum of GenVM validators **independently** inspects it - is it a strict descendant of the baseline, does it live in that repository and on the delivery ref, did it leave CI untouched, is the attested CI check-run for that very commit green, how many tests pass, what is the branch coverage, are there critical findings, does the diff genuinely implement the milestone description - and the contract pays out, or doesn't, based on that verdict. No multisig, no arbiter, no "client went silent".
 
 ```
 contracts/git_escrow.py   the intelligent contract (GenVM, Python)
-tests/                    direct-mode pytest cases (deposit math, attested CI, delivery refs, dispute invariance, external faults, no-deadlock paths, validator votes)
+tests/                    direct-mode pytest: test_git_escrow.py (protocol behaviour) + test_adversarial.py (exploits that must revert)
 frontend/                 Next.js + Tailwind dashboard (live against Studio Next)
 scripts/                  deploy.py, verify_live.py, simulate_dispute.py
 deployments/              recorded Studio Next deployment
@@ -56,20 +56,25 @@ flowchart LR
 
 ### What validators check (`evaluate_milestone_delivery`)
 
-Every check is a deterministic function of **immutable data bound to the commit SHA** plus the live availability of the repository, so independent validators converge on the same answer. No LLM sits in the loop, which means nothing the contractor writes can ever be interpreted as an instruction.
+Every gate except the last is a deterministic function of **immutable data bound to the commit SHA** plus the live availability of the repository, so independent validators converge on the same answer. The final gate is an **LLM provenance review** that is deliberately limited to a *veto*: it only runs after every deterministic gate has passed, it can never rescue a commit those gates rejected, the contractor-authored diff and CI text reach it inside fenced "untrusted data" blocks with instructions to treat any embedded instruction as bad faith, and validators must reach the same boolean verdicts (`implements_milestone`, `ci_provenance_ok`) or the round rotates. A dispute re-check does not re-sample the model: the verdict the consensus accepted at submission is carried over.
 
 The repository is bound by its **numeric GitHub id** when the contractor accepts (a consensus round resolves `owner/repo` to an id, following 301 redirects). Every later call goes through `/repositories/{id}`, so a rename or transfer never breaks evaluation.
 
 | # | Check | Source | Failure code |
 |---|-------|--------|--------------|
 | 0 | Repository reachable (not deleted, private or blocked) | `GET /repositories/{id}` | `repo_unavailable` -> **frozen**, never slashed |
-| 1 | Commit exists, payload belongs to this repository | `GET /repositories/{id}/commits/{sha}` (`sha`, `url`, `html_url` must match the repository's current `full_name`) | `commit_not_found`, `spoofed_payload` |
+| 1 | Commit exists, payload belongs to this repository | `GET /repositories/{id}/commits/{sha}` (`sha`, `url`, `html_url` must match the repository's current `full_name`) | `commit_not_found`, `spoofed_payload` (both **revert**) |
+| 1a | **Baseline ancestry** - the delivered commit is strictly *ahead* of the escrow's `baseline_commit_sha` (the baseline itself, ancestors, diverged histories, unrelated roots all fail) | `GET .../compare/{baseline}...{sha}` (`status == ahead`, `behind_by == 0`) | `not_descendant_of_baseline` (**reverts**) |
+| 1b | **CI untouched** - no file under `.github/` added / modified / removed / renamed in the baseline...delivery diff; no test file deleted or moved out of the test tree; no always-green construct added to tests or test tooling (`assert True`, `\|\| true`, `exit 0`, `pytest.mark.skip/xfail`, `it.skip`, `continue-on-error`, `passWithNoTests`, `pytest_collection_modifyitems`, `--deselect`, ...); a diff of 300+ files is unauditable and fails closed | same compare response (`files[].patch`) | `ci_config_tampered`, `tests_removed`, `rigged_tests` (**revert**), `diff_too_large` |
 | 2 | Commit is in the **delivery ref** (see below) | `delivery_ref` = `""` target branch -> `compare/{branch}...{sha}`; `pull/N` -> `GET /pulls/N` (head SHA must equal the commit, base must be the agreed branch); any other branch -> `compare/{ref}...{sha}` | `commit_not_on_ref` |
-| 3 | **Attested CI**: the check-run with the milestone's exact `check_name`, created by the exact `app_id` (default `15368` = GitHub Actions), completed with `success`; newest re-run wins | `GET .../commits/{sha}/check-runs` | `ci_attestation_missing`, `ci_pending`, `ci_failed` |
+| 3 | **Attested CI**: the check-run with the milestone's exact `check_name`, created by the exact `app_id` (default `15368` = GitHub Actions), **executed against exactly the delivered commit** (`head_sha`), completed with `success`; newest re-run wins | `GET .../commits/{sha}/check-runs` | `ci_attestation_missing`, `ci_pending`, `ci_failed` |
 | 4 | Passing tests >= minimum, zero failing | parsed from **that check-run's output** (`120 passed`, `0 failed`) | `tests_below_minimum`, `tests_failing` |
 | 5 | Branch coverage >= minimum | same check-run output (`Branch coverage: 91.5%`) | `coverage_below_minimum` |
 | 6 | Zero critical lint / vulnerability findings (unknown counts as **not clean**) | same check-run output (`Critical issues: 0`) | `critical_findings` |
-| 7 | Optional `.gitescrow/report.json` must **strictly match** the check-run | `raw.githubusercontent.com/{repo}/{sha}/.gitescrow/report.json` | `SPOOFED_REPORT_PAYLOAD` |
+| 7 | Optional `.gitescrow/report.json` must **strictly match** the check-run | `raw.githubusercontent.com/{repo}/{sha}/.gitescrow/report.json` | `SPOOFED_REPORT_PAYLOAD` (**reverts**) |
+| 8 | **LLM provenance review** (veto only): the diff implements the milestone's `description`, and the CI output credibly comes from genuinely exercising it (counts and coverage plausible for the diff, tests not neutered / skipped / stubbed) | `gl.nondet.exec_prompt` over the diff, check-run output and description | `milestone_not_implemented` (recorded, costs an attempt), `ci_provenance_rejected` (**reverts**), `review_missing` |
+
+**Revert vs. record.** A verdict containing a *provenance violation* (`commit_not_found`, `spoofed_payload`, `SPOOFED_REPORT_PAYLOAD`, `not_descendant_of_baseline`, `ci_config_tampered`, `tests_removed`, `rigged_tests`, `ci_provenance_rejected`) reverts the transaction with `submission rejected: <codes>`: nothing is recorded, the submission signature's nonce is not burned, no attempt is consumed and no payout path moves. Ordinary shortfalls (too few tests, low coverage, CI red/pending, `milestone_not_implemented`) are recorded in `last_report` and consume an attempt as before.
 
 **Delivery refs - no merge veto.** `evaluate_milestone_delivery(milestone, sha, delivery_ref)` takes the place the commit lives. The default `""` is the agreed target branch. `pull/N` verifies the commit as the **head of pull request N**, which must target the agreed branch, so an *unmerged* PR whose attested check-run is green is a valid delivery: the employer cannot veto payment by declining to merge, closing the PR, or rewriting `main`. A contractor may also name any other branch of the repository. The ref only has to *contain* the commit; trust comes from the attested check-run bound to that SHA.
 
@@ -83,24 +88,25 @@ A contractor-committed `report.json` can **never** substitute for, or improve on
 
 > **Workflow requirement: publish results through the Checks API.** A stock GitHub Actions job conclusion (`success`/`failure`) is not enough: validators parse the check-run's `output.title` / `output.summary` / `output.text`. Your workflow must therefore publish its test, coverage and security numbers there, either with a step that calls the Checks API (`POST /repos/{repo}/check-runs` or `PATCH /repos/{repo}/check-runs/{id}` with `output: { title, summary }`), or with an action that writes a test summary into the check-run output in the format above (`N passed`, `N failed`, `Branch coverage: X%`, `Critical issues: N`). The check-run's **name** must equal the milestone's `check_name` and it must be created by the milestone's `app_id` (`15368` for the built-in `GITHUB_TOKEN` / GitHub Actions). A job that only writes to the step summary (`$GITHUB_STEP_SUMMARY`) or uploads an artifact is invisible to the validators and will fail with `ci_attestation_missing` or `tests_below_minimum`.
 
-The validator function re-collects the evidence itself and requires the leader's `passed`, `failures`, repository availability, test count, coverage, CI state and report-mismatch flag to match exactly. A leader that forges a PASS, inflates one number, hides a report mismatch or fakes a repository outage is voted down and the round rotates. Errors are classified (`[EXPECTED]`, `[EXTERNAL]`, `[TRANSIENT]`) so rate limits, 5xx and unresolved 301s never convert into a verdict or a penalty.
+The validator function re-collects the evidence itself and requires the leader's `passed`, `failures`, repository availability, test count, coverage, CI state, report-mismatch flag, baseline-ancestry flag, tamper / rig flags and review verdicts to match exactly. A leader that forges a PASS, inflates one number, hides a report mismatch or fakes a repository outage is voted down and the round rotates. Errors are classified (`[EXPECTED]`, `[EXTERNAL]`, `[TRANSIENT]`) so rate limits, 5xx and unresolved 301s never convert into a verdict or a penalty.
 
 **Attempt conservation.** A delivery attempt is consumed only by a real verdict. Transient faults revert (nothing consumed). A verdict that is purely `ci_pending` costs a free *CI poll* (up to 20 per milestone, then it counts). An unreachable repository freezes the milestone and costs nothing.
 
 ### Milestone state machine
 
 ```
-PENDING ──evaluate(sha, delivery_ref): PASS──► VERIFIED ──settle (after 48h) / approve (employer)──► RELEASED
+FUNDED ──evaluate(sha, ref, signature): PASS──► SUBMITTED ──settle (after 48h) / approve (signed by employer)──► FINALIZED
    │  ▲                                          │
-   │  └─ dispute OVERTURNED (pinned evidence     │  dispute UPHELD (the delivered SHA + pinned check-run
-   │     changed): deadline := max(deadline,     │  still verify, whatever happened to the branch)
-   │     now + 72h), attempts reset              └──► RELEASED (disputer's bond -> contractor)
+   │  │  DISPUTED ◄── dispute OVERTURNED         │  dispute UPHELD (the delivered SHA + pinned check-run
+   │  │  (re-submit allowed from FUNDED and      │  still verify, whatever happened to the branch)
+   │  │  DISPUTED): deadline := max(deadline,    └──► FINALIZED (disputer's bond -> contractor)
+   │  │  now + 72h), attempts reset
    │
    ├── deadline + resubmit grace passed, repo reachable, claim_default ──► DEFAULTED (refund + slashed bond)
    │
    └── repo deleted / private / blocked (claim_default or evaluate) ──► FROZEN_EXTERNAL_FAULT
             ├─ thaw_milestone (anyone) or evaluate, once the repo answers
-            │     ──► PENDING: deadline >= now + 72h, at least ONE fresh attempt (attempts <= 4)
+            │     ──► FUNDED: deadline >= now + 72h, at least ONE fresh attempt (attempts <= 4)
             └─ cancel_fault_free ──► CANCELLED_FAULT_FREE (employer refunded, bond returned intact)
                   * both parties consent, or
                   * after 7 days: repo still unreachable, OR attempts exhausted, OR deadline elapsed
@@ -108,23 +114,44 @@ PENDING ──evaluate(sha, delivery_ref): PASS──► VERIFIED ──settle (
 (OPEN escrow, employer cancel ──► CANCELLED)
 ```
 
-**No milestone can be deadlocked.** Every non-terminal state has a path that does not depend on the counterparty: `OPEN` -> employer `cancel_escrow`; `PENDING` -> delivery, or `claim_default` after the deadline; `VERIFIED` -> `settle_milestone` after 48h (no repo access needed); `FROZEN` -> `thaw_milestone` / `evaluate`, or after the 7-day cooldown a unilateral `cancel_fault_free` (the cancel is refused only while the repo is reachable *and* the contractor still has attempts *and* time left, in which case thaw/resubmit is the path). A frozen milestone whose attempts are spent can always be thawed (a fresh attempt is granted) or cancelled. Funds therefore always end in one of: contractor payout, employer refund + slash, or a fault-free refund.
+**One finalizer, one payout.** Every wei a milestone holds lives in its `escrowed` field. All terminal transitions begin with `_debit`, which reads `escrowed`, sets it to **0**, and reverts if it was already 0 - *before* any transfer is queued. `FINALIZED` is reached only through `_finalize`, which additionally requires the status to be `SUBMITTED` and `paid_out == 0`, then records `paid_out` and `finalized_at`. A finalized milestone therefore holds exactly 0 wei, cannot be settled, approved, disputed, evaluated, defaulted, thawed or cancelled again (each path reverts with `already finalized` / its own state guard), and `get_solvency()` reconciles `total_in == total_paid_out + Σ escrowed + fees_retained` after every path. A `SUBMITTED` milestone cannot be re-evaluated either, so a contractor cannot swap in a different commit after a delivery was verified.
+
+**No milestone can be deadlocked.** Every non-terminal state has a path that does not depend on the counterparty: `OPEN` -> employer `cancel_escrow`; `FUNDED` / `DISPUTED` -> delivery, or `claim_default` after the deadline; `SUBMITTED` -> `settle_milestone` after 48h (no repo access needed); `FROZEN` -> `thaw_milestone` / `evaluate`, or after the 7-day cooldown a unilateral `cancel_fault_free` (the cancel is refused only while the repo is reachable *and* the contractor still has attempts *and* time left, in which case thaw/resubmit is the path). A frozen milestone whose attempts are spent can always be thawed (a fresh attempt is granted) or cancelled. Funds therefore always end in one of: contractor payout, employer refund + slash, or a fault-free refund.
 
 ### Contract surface
 
 | Method | Who | What |
 |---|---|---|
-| `create_escrow(contractor, repo, branch, title, bond_bps, milestones_json)` *payable* | employer | deposits `sum(rewards)`; 1-10 milestones, bond 1000-2000 bps |
-| `accept_escrow(id)` *payable* | contractor | posts `sum(bonds)`; a consensus round binds the repository's numeric id |
+| *constructor* `(signing_chain_id)` | deployer | the chain id every authorization signature is bound to (`61997` on Studio Next) |
+| `create_escrow(contractor, repository_url, branch, title, bond_bps, baseline_commit_sha, milestones_json)` *payable* | employer | deposits `sum(rewards)`; `repository_url` must be exactly `https://github.com/<owner>/<repo>`; `baseline_commit_sha` is a full 40-hex commit; each milestone carries a required `description`; 1-10 milestones, bond 1000-2000 bps |
+| `accept_escrow(id)` *payable* | contractor | posts `sum(bonds)`; consensus binds the repository's numeric id **and** checks the baseline is a real commit of that repository that the agreed branch descends from |
 | `cancel_escrow(id)` | employer | refund while the contractor has not bonded |
-| `evaluate_milestone_delivery(milestone, sha, delivery_ref)` | contractor | **consensus verification** of the commit on the target branch / a branch / `pull/N`; records the report and pins the check-run |
+| `evaluate_milestone_delivery(milestone, sha, delivery_ref, nonce, expires_at, signature)` | contractor's **signature** (any relayer) | **consensus verification** of the commit on the target branch / a branch / `pull/N`; records the report and pins the check-run |
 | `settle_milestone(id)` | anyone | release after the 48h window |
-| `approve_milestone(id)` | employer | waive the window, release now |
+| `approve_milestone(id, nonce, expires_at, signature)` | employer's **signature** (any relayer) | waive the window, finalize now |
 | `file_dispute(id, reason)` *payable* | employer | escalating bond + non-refundable 3% fee; fresh quorum re-verification; overturn grants a 72h resubmit window |
 | `claim_default(id)` | anyone | after deadline **and** resubmit grace: probes the repo, then refund + slashed bond to the employer (or freezes if the repo is unreachable) |
 | `thaw_milestone(id)` | anyone | revive a frozen milestone once the repo answers (fresh 72h window, >= 1 fresh attempt) |
 | `cancel_fault_free(id)` | employer / contractor | neutral exit for a frozen milestone: employer refunded, bond returned intact |
-| `get_escrow`, `get_milestone`, `list_escrows`, `get_stats`, `get_solvency`, `quote_dispute_bond`, `quote_dispute_fee`, `get_strikes` | views | |
+| `get_escrow`, `get_milestone`, `list_escrows`, `get_stats`, `get_solvency`, `quote_dispute_bond`, `quote_dispute_fee`, `get_strikes`, `get_nonce(address)`, `get_signing_domain()`, `authorization_message(action, milestone, sha, ref, nonce, expires)` | views | |
+
+### Wallet signatures (injected-wallet authorization)
+
+Client approvals and contractor submissions are authorised by an **EIP-191 `personal_sign`** signature that the contract verifies itself. The signed text is rebuilt byte for byte from contract state (`authorization_message` returns it):
+
+```
+GitEscrow authorization v1
+action: SUBMIT | APPROVE
+chain: 61997
+contract: 0x<this contract, lower-case>
+milestone: <id>
+commit: <40-hex>          (APPROVE: the commit that was verified)
+ref: <delivery ref>
+nonce: <signer's next nonce>
+expires: <unix seconds, at most 7 days ahead>
+```
+
+The contract computes `keccak256("\x19Ethereum Signed Message:\n" + len + text)`, recovers the secp256k1 signer in pure Python (both implemented in the contract and checked against `eth_account` / `eth_utils` in the test-suite), and requires it to equal the registered **contractor** (SUBMIT) or **employer** (APPROVE). Signatures with a wrong length, `r`/`s` out of range, high-`s` (malleable) form or an unknown recovery id are rejected; a signature is bound to one contract, chain, milestone, action, commit, ref, nonce and expiry; the nonce is per signer and burned when the action commits, so replays fail with `stale or future nonce`. Because the *signature*, not `msg.sender`, authorises the action, anyone may relay it. The frontend asks the injected wallet for `personal_sign` (hex-encoded text), recovers the signer locally and refuses to send a transaction the contract would revert (`frontend/lib/authorization.ts`, pinned to a Python-produced vector in `authorization.test.ts`).
 
 ---
 
@@ -134,9 +161,9 @@ Notation: reward `R`, bond `b·R` with `b ∈ [10%, 20%]`, contractor's cost of 
 
 ### Slashing conditions
 
-* **Default** - milestone still `PENDING` after its deadline *and* any resubmit grace window, **and** a consensus probe confirms the repository is reachable: 100% of that milestone's bond goes to the employer together with the refunded reward. Callable by anyone.
+* **Default** - milestone still `FUNDED` / `DISPUTED` after its deadline *and* any resubmit grace window, **and** a consensus probe confirms the repository is reachable: 100% of that milestone's bond goes to the employer together with the refunded reward. Callable by anyone.
 * A **failed verification is not slashing**. A rejected delivery costs only an attempt (max 5); the contractor can fix and resubmit until the deadline.
-* **Verified milestones cannot be defaulted**, even after the deadline: the contractor delivered in time.
+* **Submitted milestones cannot be defaulted**, even after the deadline: the contractor delivered in time.
 * **External faults are never slashing.** A deleted, private or blocked repository freezes the milestone instead (see below).
 
 ### Escalating dispute bonds and the non-refundable fee (anti-griefing)
@@ -157,8 +184,8 @@ fee  = max(0.02 GEN, 3% of reward)                                              
 | 1st, by an address with 4+ lost disputes | 16 GEN | 3 GEN | 19 GEN |
 
 * A dispute is resolved **in the same transaction** by a fresh quorum re-verification of the same commit, so it cannot freeze funds - the worst-case delay is one consensus round, not a time lock.
-* **Upheld delivery** (the dispute was frivolous): the bond is forfeited *to the contractor* as compensation, the fee is retained, and the milestone releases immediately. The disputer earns a strike that raises every future bond for that address.
-* **Overturned delivery** (e.g. history force-pushed after verification): the bond is refunded, the **fee is not**, and the milestone returns to `PENDING` with `deadline = max(deadline, now + 72h)` and a fresh attempt budget. `claim_default` is blocked until that window has passed, so an employer cannot disprove a delivery after the deadline and then slash the bond before the contractor can react.
+* **Upheld delivery** (the dispute was frivolous): the bond is forfeited *to the contractor* as compensation, the fee is retained, and the milestone is finalized immediately. The disputer earns a strike that raises every future bond for that address.
+* **Overturned delivery** (e.g. history force-pushed after verification): the bond is refunded, the **fee is not**, and the milestone becomes `DISPUTED` (open for re-delivery) with `deadline = max(deadline, now + 72h)` and a fresh attempt budget. `claim_default` is blocked until that window has passed, so an employer cannot disprove a delivery after the deadline and then slash the bond before the contractor can react.
 * A dispute **cannot be decided** while the repository is unreachable or the pinned check-run is `pending` - the employer cannot win by deleting the repo or re-triggering CI. It also **cannot be won by rewriting the branch**: validators judge the delivered SHA and its pinned check-run, not the branch tip.
 
 The fee makes a zero-cost harassment dispute impossible: every dispute burns at least 3% of the milestone regardless of outcome, the bond ladder bounds spam on one milestone, and strikes raise the price for repeat offenders.
@@ -169,14 +196,14 @@ Every wei is accounted for in exactly one of three buckets, and `get_solvency()`
 
 ```
 total_in  ==  total_paid_out  +  liabilities  +  fees_retained
-liabilities = Σ over PENDING / VERIFIED / FROZEN milestones of (reward + bond if the escrow is ACTIVE)
+liabilities = Σ over all milestones of `escrowed`  (reward before the contractor bonds, reward + bond after; 0 once terminal)
 ```
 
 | Transition | In | Out | Liabilities |
 |---|---|---|---|
 | create_escrow | +ΣR | | +ΣR |
 | accept_escrow | +Σb·R | | +Σb·R |
-| release | | R + b·R | −(R + b·R) |
+| finalize | | R + b·R | −(R + b·R) |
 | claim_default | | R + b·R (employer) | −(R + b·R) |
 | cancel_escrow | | ΣR | −ΣR |
 | cancel_fault_free | | R (employer) + b·R (contractor) | −(R + b·R) |
@@ -221,28 +248,26 @@ Branch heads, check-run states and repository visibility are **mutable off-chain
 * **Re-run and rewrite attacks.** Disputes are pinned to the check-run recorded at delivery, so re-running CI (a new run id) does nothing; they never re-evaluate the branch, so force-pushing, resetting or deleting it does nothing; and they are refused while the pinned run is `pending` or the repository is unreachable. The only way to overturn is for the *pinned evidence itself* to change (the app updates that run to a failure, or the run or commit disappears), in which case the contractor gets the 72h resubmit window.
 * **Branch tip is irrelevant after delivery.** Ref containment is checked once, at submission. After that the delivery stands on its SHA.
 
-### Commit Baseline & Author Binding Limitation
+### Commit Baseline & Author Binding
 
-Milestone evaluation answers one question: *does this commit exist in the agreed delivery ref (target branch, a branch, or the head of `pull/N`) and does the pinned check-run for that exact SHA report passing results above the milestone's thresholds?* It does **not**:
+Each escrow is created against an exact `repository_url` and a `baseline_commit_sha`, and the contractor's `accept_escrow` consensus round proves the baseline is a real commit of that repository which the agreed branch descends from. Every delivery must then be a **strict descendant** of the baseline (`compare/{baseline}...{sha}` reports `ahead`, `behind_by == 0`). This closes the replay hole: an already-existing green commit, the baseline itself, an ancestor of it, a commit on a diverged history, or a third-party PR on an unrelated root can never satisfy a milestone. The same check runs again, deterministically, when a delivery is disputed.
 
-* **attest the Git author.** There is no check that the commit was written, signed or pushed by the contractor (no GPG/SSH signature verification, no author or committer matching). Anyone can submit any SHA, and the contract treats a green commit as a green commit.
-* **diff against a baseline.** It does not compare the commit with the repository's state at escrow creation, so it cannot tell *new* work from work that already existed.
+What it still does **not** do, and the employer should understand before funding:
 
-Consequently an **already-existing green commit**, or the head of a **third-party pull request** that happens to satisfy the thresholds, can satisfy a milestone that was never actually worked on. GitEscrow cannot detect this on-chain; the employer must close the gap when creating the milestone:
-
-* **Calibrate thresholds above the current baseline.** Set `min_tests` and `min_coverage_bps` to realistic *incremental* values: strictly more passing tests, and strictly higher branch coverage, than the repository has today. A milestone whose bar is already cleared by `main` is paid out on day one.
-* **Or pin an explicit `expected_sha`.** A non-empty `expected_sha` makes the contract accept exactly that commit and nothing else. This is the strongest guard, but it means agreeing on the delivery commit up front (for example a SHA the employer has reviewed and tagged), so use it for fixed, reviewable deliverables.
-* Prefer an `app_id`/`check_name` pair the contractor cannot satisfy with someone else's code (see below) and review the PR before bonding.
+* **Author attestation.** Nothing verifies the Git author, committer or a GPG/SSH signature on the commit. A contractor-signed submission proves *who submitted* the SHA, not who wrote it. A descendant of the baseline that someone else authored (for example a third-party fork-network commit that also happens to be on the delivery ref, or a PR by another developer) can still be submitted.
+* **Pre-delivery work.** If the employer's own branch already contains unreleased work *after* the baseline that meets the thresholds, it counts as a descendant. Pick the baseline as the tip the work should start from, and keep thresholds incremental.
+* **Fork-network objects.** GitHub serves commits from a repository's fork network through the parent's API; containment on the delivery ref (`on_ref`) is what excludes them, and a `pull/N` ref must be that PR's head targeting the agreed branch.
+* **Semantic judgement is probabilistic.** Whether the diff "implements the description" is decided by an LLM review quorum that can only *veto*. A determined contractor can try prompt injection through the diff (it is fenced and flagged as untrusted, and an injection can only turn a veto into a pass if every deterministic gate already held), so keep rewards proportionate and use `expected_sha` for fixed deliverables.
 
 ### Check-Run Persistence & Workflow Control
 
-* **Check-runs must stay on the GitHub Checks API.** Validators read the check-run's `output` at verification time and again, pinned by run id, if the delivery is disputed. If a check-run is deleted or its app is uninstalled, a re-check finds no pinned run and reports `ci_attestation_missing`, which is the one thing that can overturn an already verified delivery. Keep the CI app installed and do not prune check-runs for delivered SHAs until the milestone is `RELEASED`.
+* **Check-runs must stay on the GitHub Checks API.** Validators read the check-run's `output` at verification time and again, pinned by run id, if the delivery is disputed. If a check-run is deleted or its app is uninstalled, a re-check finds no pinned run and reports `ci_attestation_missing`, which is the one thing that can overturn an already verified delivery. Keep the CI app installed and do not prune check-runs for delivered SHAs until the milestone is `FINALIZED`.
 * **Why an employer-owned repo with a pinned `check_name` matters.** The attested check-run is only as trustworthy as whoever controls the workflow that produces it. In a contractor-owned repo the contractor writes the workflow and can make it print any numbers under the right name. In an employer-owned repo, the employer fixes the workflow and the exact `check_name` / `app_id` in the milestone, so a contractor PR cannot invent a check-run that validators will accept: check-runs from other names or other apps are ignored outright, and a committed `report.json` can only corroborate the real one.
-* **Caveat: the workflow file itself must be protected.** For the plain `pull_request` trigger, GitHub runs the workflow definition from the PR's own merge commit, so a contractor PR can edit the workflow that reports its own results. Close that hole on the employer's side with repository **rulesets / required workflows** (the workflow comes from the base branch), a `pull_request_target` or `workflow_run` design that never executes PR-supplied workflow definitions, or a dedicated GitHub App `app_id` that publishes the check-run from outside the repository. GitEscrow cannot verify this configuration on-chain; it only guarantees that nothing but the named check-run from the named app counts.
+* **The workflow file is protected by the diff audit.** For the plain `pull_request` trigger GitHub runs the workflow definition from the PR's own merge commit, so a contractor PR could edit the workflow that reports its own results. Validators therefore reject (revert) any delivery whose baseline...commit diff touches `.github/`, deletes or relocates test files, or adds always-green constructs to tests or test tooling, and require the attested check-run to have executed against exactly the delivered commit. **Residual risk, disclosed:** the audit sees what changed *in the repository between baseline and delivery*. It cannot see repository or organisation settings (rulesets, required workflows, secrets), a workflow that is pulled in remotely, behaviour hidden in application code that detects CI and fakes success, or a hostile `.github/` already present *at* the baseline. The employer should still protect the base branch with required workflows or a neutral GitHub App `app_id`, and treat the LLM review as a second line of defence, not a proof.
 
 ### Public Recovery (`thaw_milestone`)
 
-`thaw_milestone` is deliberately **permissionless**: anyone (employer, contractor, a third-party keeper or a bot) can call it. Its only effect is to move a `FROZEN_EXTERNAL_FAULT` milestone back to `PENDING` once a validator quorum confirms the repository is reachable again, granting a fresh 72h window and at least one fresh attempt. It never moves funds, never slashes, and reverts unless the milestone is frozen *and* the repo currently answers, so it cannot be used to grief either side. This exists so that an outage which resolves itself cannot leave a milestone stranded waiting for a specific party to notice: the recovery needs no cooperation from the contractor or the employer. If nobody thaws it, the 7-day `cancel_fault_free` exit still guarantees a terminal outcome.
+`thaw_milestone` is deliberately **permissionless**: anyone (employer, contractor, a third-party keeper or a bot) can call it. Its only effect is to move a `FROZEN_EXTERNAL_FAULT` milestone back to `FUNDED` once a validator quorum confirms the repository is reachable again, granting a fresh 72h window and at least one fresh attempt. It never moves funds, never slashes, and reverts unless the milestone is frozen *and* the repo currently answers, so it cannot be used to grief either side. This exists so that an outage which resolves itself cannot leave a milestone stranded waiting for a specific party to notice: the recovery needs no cooperation from the contractor or the employer. If nobody thaws it, the 7-day `cancel_fault_free` exit still guarantees a terminal outcome.
 
 ### GitHub API rate limits near close deadlines
 
@@ -269,10 +294,24 @@ pip install -r scripts/requirements.txt genvm-lint
 
 ```bash
 genvm-lint check contracts/git_escrow.py     # lint + SDK validation: 0 errors
-pytest                                       # direct-mode tests (in-memory GenVM, ~3 min)
+pytest                                       # direct-mode tests: protocol suite + adversarial suite (in-memory GenVM, under a minute)
 ```
 
-The suite covers deposit math and the bond lock-up, a passing delivery with parsed test/coverage metrics, every rejection path (too few tests, failing tests, low coverage, critical findings, missing commit, off-branch commit, CI red/pending/missing, expired deadline, spoofed report, spoofed repository payload), default + slashing, the escalating dispute ladder and strikes, and validator agreement/disagreement against swapped GitHub mocks (`direct_vm.run_validator`).
+> If `pytest` fails during fixture setup with `runner py-genlayer:... not under .../trees-v2/<version>`, the direct-mode loader resolved a GenVM release that is not cached locally. Pin one that is: `GENVM_VERSION=v0.6.0-rc8 pytest` (and `GENVM_VERSION=v0.6.0-rc8 genvm-lint check contracts/git_escrow.py`).
+
+`tests/test_adversarial.py` is the **adversarial direct-mode suite**. Each exploit class must revert, and every negative test also proves nothing moved (milestone status, attempts, held funds and the solvency ledger are identical before and after):
+
+| Exploit | What the tests throw at the contract |
+|---|---|
+| a) pre-baseline / replayed commit | `behind`, `diverged`, `identical` and no-common-ancestor comparisons; `ahead` with `behind_by > 0`; the baseline SHA itself; a PR-ref smuggle; a baseline that is not on the agreed branch at `accept`; the same check re-run on a dispute |
+| b) commit from an unrelated repository | a SHA unknown to the bound repository id, payloads naming other repositories, a report for another repository, a swapped numeric id, fork-network objects off the branch, a PR head that is another commit |
+| c) CI rigged to always pass | every change under `.github/` (added / modified / removed / renamed), 19 always-green constructs across test files and test tooling, deleted or relocated tests, a 300-file unauditable diff, a check-run that ran on a different commit, LLM veto (`ci_provenance_rejected`), malformed model output (fails closed), the model never consulted when a deterministic gate fails |
+| d) invalid wallet signatures | malformed / zero / wrong-length signatures, a stranger, the wrong role (employer signs a SUBMIT, contractor signs an APPROVE), signatures redirected to another milestone / commit / ref / action / contract / chain, tampered r / s / v, high-`s` malleability, out-of-range `r`/`s`, bad recovery ids, expired and over-long expiry, changed nonce or expiry after signing, future nonce, replay after consumption |
+| e) double payout | settle twice, approve after settle, settle after approve, re-evaluate, dispute, default, thaw and cancel after `FINALIZED`; swapping the commit after `SUBMITTED`; default / cancel twice; every terminal status holds exactly 0 wei; the ledger is unchanged across a barrage of post-finalization attacks |
+
+`TestCryptoParity` checks the contract's pure-Python `keccak256` and `ecrecover` against `eth_utils` / `eth_account` on 30 random keys (both recovery parities). Mutation checks - disabling the signer comparison, nonce check, baseline ancestry, the finalized guard, the balance zeroing, the check-run `head_sha` binding, the workflow-tamper detector, the rig scanner, the revert-on-violation rule and the low-`s` rule one at a time - each make the suite fail (the only surviving mutant is the redundant `paid_out != 0` belt-and-braces check in `_finalize`, which `_debit` and the `SUBMITTED` status guard already make unreachable).
+
+The protocol suite covers deposit math and the bond lock-up, a passing delivery with parsed test/coverage metrics, every rejection path (too few tests, failing tests, low coverage, critical findings, missing commit, off-branch commit, CI red/pending/missing, expired deadline, spoofed report, spoofed repository payload), default + slashing, the escalating dispute ladder and strikes, and validator agreement/disagreement against swapped GitHub mocks (`direct_vm.run_validator`).
 
 ### Adversarial simulation (no network, no keys)
 
@@ -280,7 +319,7 @@ The suite covers deposit math and the bond lock-up, a passing delivery with pars
 python scripts/simulate_dispute.py
 ```
 
-A contractor throws a ghost commit, a spoofed report, a repository swap, an off-branch commit and cherry-picked metrics at the escrow; every one is rejected. Then an honest validator votes `DISAGREE` against a leader that forged a PASS, and a ghosting contractor is slashed.
+A contractor throws a ghost commit, a pre-baseline replay, an unrelated repository, a rigged workflow, an always-true test, a forged report, a stolen check-run, forged wallet signatures and a double-payout attempt at the escrow; every one is rejected. Then an honest validator votes `DISAGREE` against a leader that forged a PASS, and a ghosting contractor is slashed.
 
 ### Dashboard
 
@@ -288,12 +327,12 @@ A contractor throws a ghost commit, a spoofed report, a repository swap, an off-
 cd frontend
 npm install
 npm run dev            # http://localhost:3000
-npm test               # TypeScript copy of the bond / dispute rules, pinned to the Python numbers
+npm test               # bond / dispute rules pinned to the Python numbers; wallet authorization pinned to a Python-signed vector
 ```
 
 The dashboard is live-only: it reads and writes the contract on Studio Next (address in `frontend/lib/config.ts`) through `genlayer-js`.
 
-* **Connect Wallet** uses any injected EIP-1193 wallet (`window.ethereum`, e.g. MetaMask). It requests your account, then adds or switches to *GenLayer Studio Next* (chain id `61997` / `0xf22d`, symbol `GEN`, RPC `https://studio-next.genlayer.com/api`) and signs every transaction in the wallet. A "Switch to Studio Next" button appears if the wallet drifts to another chain. Disconnect returns to the logged-out state.
+* **Connect Wallet** uses any injected EIP-1193 wallet (`window.ethereum`, e.g. MetaMask). It requests your account, then adds or switches to *GenLayer Studio Next* (chain id `61997` / `0xf22d`, symbol `GEN`, RPC `https://studio-next.genlayer.com/api`) and signs every transaction in the wallet. Submitting a delivery and approving a milestone additionally ask the wallet for a gas-free `personal_sign` authorization (`lib/authorization.ts`); the dashboard recovers the signer locally and refuses to send a transaction the contract would reject. A "Switch to Studio Next" button appears if the wallet drifts to another chain. Disconnect returns to the logged-out state.
 * **Demo / Quick Test** (only offered when no wallet extension is installed) generates a throwaway key that lives in this browser only.
 * **Fund** credits 1000 GEN from the Studio faucet to the connected address. The faucet (`sim_fundAccount`) needs a positive *integer* wei amount and keys balances by exact address casing, so the amount is sent as a BigInt-derived decimal string and the address is EIP-55 checksummed first. Studio rate-limits an IP to 30 RPC requests per minute; the dashboard polls every 45s and backs off automatically on `-32029`.
 
@@ -302,9 +341,14 @@ Panels: escrow explorer + creator (repo, branch, milestones, thresholds, bond sl
 ### Deploy to GenLayer Studio Next
 
 ```bash
-python -m scripts.deploy                    # deploy, seed two demo escrows, export artifacts
-python scripts/verify_live.py               # deposit -> bond -> commit -> consensus -> default & slash
-python scripts/verify_live.py --repo OWNER/REPO --sha FULL_SHA   # ... -> verified -> release
+python -m scripts.deploy                    # deploy (constructor arg = signing chain id 61997), seed demo escrows, export artifacts
+python scripts/verify_live.py lifecycle \
+    --repo-url https://github.com/OWNER/REPO --branch main \
+    --baseline BASELINE_SHA --sha DELIVERY_SHA \
+    --old-sha SHA_BEFORE_BASELINE --foreign-sha SHA_FROM_ANOTHER_REPO
+python scripts/verify_live.py default       # failure path: baseline replay refused -> deadline -> default & slash
 ```
 
 `deploy.py` writes `deployments/studio-next.json`, `frontend/lib/gitescrow.generated.json` (address + ABI) and updates `CONTRACT_ADDRESS` in `frontend/lib/config.ts`, which drives the dashboard and footer links. Test keys are generated into `deployments/.keys/` (git-ignored) and funded from the Studio faucet; override with `GITESCROW_EMPLOYER_KEY` / `GITESCROW_CONTRACTOR_KEY`.
+
+`verify_live.py lifecycle` prints every transaction hash with its explorer link, including the **reverted** attack transactions, so the output is the reviewer's evidence trail. It needs a repository whose CI publishes the `ci/tests` check-run: `examples/gitescrow-ci.yml` is a template. Commit it in the baseline (a delivery may not touch `.github/`).

@@ -26,6 +26,12 @@ export function ConsensusPanel({ outcome, report, minTests, minCoverageBps, chec
               <Check ok={r.repo_available} label="Repository reachable" detail={r.repo_available ? "bound by numeric id (rename-proof)" : "deleted, private or blocked — external fault"} />
               <Check ok={r.repo_available ? r.commit_exists : null} label="Commit authenticity" detail={r.commit_exists ? "SHA exists in repository" : "SHA not found via GitHub API"} />
               <Check ok={r.commit_exists ? r.on_ref : null} label={r.ref_checked === false ? "Delivery ref (not re-checked in disputes)" : "On delivery ref"} detail={r.ref_checked === false ? "dispute judges the delivered SHA itself" : `${r.delivery_ref ? r.delivery_ref : "target branch"} contains the commit`} />
+              <Check ok={r.commit_exists ? r.descends_from_baseline ?? null : null} label="Descends from baseline"
+                detail={r.descends_from_baseline === false ? "not a strict descendant of the escrow baseline commit" : "strictly ahead of the baseline commit"} />
+              <Check ok={r.commit_exists ? !(r.ci_config_tampered || r.tests_removed || r.rigged_tests) : null} label="CI left untouched"
+                detail={r.diff_findings && r.diff_findings.length ? r.diff_findings.join("; ") : `${r.changed_files ?? 0} files changed · no workflow edits, no deleted or rigged tests`} />
+              <Check ok={r.review_done ? Boolean(r.review_implements && r.review_provenance) : null} label="Reviewer verdict"
+                detail={r.review_done ? `implements milestone: ${r.review_implements ? "yes" : "no"} · CI provenance: ${r.review_provenance ? "ok" : "rejected"}${r.review_reason ? ` · ${r.review_reason}` : ""}` : "runs only after every deterministic gate passes"} />
               <Check ok={r.commit_exists ? r.repo_match : null} label="Payload provenance" detail={r.repo_match ? "commit payload bound to this repository" : "commit payload from another repository"} />
               <Check ok={r.commit_exists ? r.ci_state === "success" : null} label="Attested check-run" detail={`${checkName ?? "check"} · app ${appId ?? "?"} · state: ${r.ci_state}`} />
               <Check ok={r.commit_exists && r.ci_state !== "none" && r.ci_state !== "pending" ? r.tests_passed >= minTests && r.tests_failed === 0 : null} label="Test results"

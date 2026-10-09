@@ -11,7 +11,11 @@ import type {
 } from "./types";
 
 import { getAddress } from "viem";
-import { CONTRACT_ADDRESS, RPC_URL } from "./config";
+import { CHAIN_ID, CONTRACT_ADDRESS, RPC_URL } from "./config";
+import {
+  assertSignedBy, buildAuthorizationMessage, normalizeCommit, normalizeRef, requestWalletSignature, signatureExpiry,
+  type AuthAction,
+} from "./authorization";
 import { parseGen } from "./format";
 import { ensureStudioNetwork, getInjected } from "./wallet";
 
@@ -45,8 +49,8 @@ function parseReport(raw: Any): Report | null {
 
 function toMilestone(m: Any): Milestone {
   return {
-    id: num(m.id), escrowId: num(m.escrow_id), index: num(m.index), title: m.title, reward: big(m.reward),
-    bond: big(m.bond), expectedSha: m.expected_sha, checkName: m.check_name, appId: num(m.app_id), minTests: num(m.min_tests), minCoverageBps: num(m.min_coverage_bps),
+    id: num(m.id), escrowId: num(m.escrow_id), index: num(m.index), title: m.title, description: m.description ?? "", reward: big(m.reward),
+    bond: big(m.bond), escrowed: big(m.escrowed), paidOut: big(m.paid_out), finalizedAt: num(m.finalized_at), expectedSha: m.expected_sha, checkName: m.check_name, appId: num(m.app_id), minTests: num(m.min_tests), minCoverageBps: num(m.min_coverage_bps),
     deadline: num(m.deadline), status: m.status, submittedSha: m.submitted_sha, deliveryRef: m.delivery_ref ?? "", checkRunId: num(m.check_run_id), attempts: num(m.attempts),
     pendingPolls: num(m.pending_polls), verifiedAt: num(m.verified_at), releaseAt: num(m.release_at),
     resubmitUntil: num(m.resubmit_until), frozenAt: num(m.frozen_at), consentMask: num(m.consent_mask),
@@ -56,7 +60,7 @@ function toMilestone(m: Any): Milestone {
 
 function toEscrow(e: Any): Escrow {
   return {
-    id: num(e.id), employer: e.employer, contractor: e.contractor, repo: e.repo, repoId: num(e.repo_id), branch: e.branch, title: e.title,
+    id: num(e.id), employer: e.employer, contractor: e.contractor, repo: e.repo, repositoryUrl: e.repository_url ?? "", baselineCommitSha: e.baseline_commit_sha ?? "", repoId: num(e.repo_id), branch: e.branch, title: e.title,
     bondBps: num(e.bond_bps), totalReward: big(e.total_reward), totalBond: big(e.total_bond),
     openMilestones: num(e.open_milestones), createdAt: num(e.created_at), status: e.status,
     milestones: (e.milestones ?? []).map(toMilestone),
@@ -294,6 +298,36 @@ export class LiveBackend implements Backend {
   subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   private emit() { this.listeners.forEach((l) => l()); }
 
+  /**
+   * Obtain the wallet signature the contract verifies: read the signer's next nonce, build the exact
+   * authorization text, have the injected wallet `personal_sign` it (or the demo key sign it), and check
+   * locally that it recovers to the connected account before any transaction is sent.
+   * Returns [nonce, expiresAt, signature] for the contract call.
+   */
+  private async authorize(action: AuthAction, milestoneId: number, commitSha: string, deliveryRef: string): Promise<[bigint, number, `0x${string}`]> {
+    if (!this.identity) throw new Error("Connect a wallet first.");
+    const signer = getAddress(this.identity.address);
+    const nonce = big(await this.read("get_nonce", [signer]));
+    const expiresAt = signatureExpiry(this.now());
+    const message = buildAuthorizationMessage({
+      action, chainId: CHAIN_ID, contract: this.contract, milestoneId, commitSha, deliveryRef, nonce, expiresAt,
+    });
+    let signature: `0x${string}`;
+    if (this.identity.kind === "injected") {
+      const provider = getInjected();
+      if (!provider) throw new Error("The browser wallet is no longer available.");
+      await ensureStudioNetwork(provider);
+      signature = await requestWalletSignature(provider, signer, message);
+    } else {
+      const sdk: Any = await import("genlayer-js");
+      const key = this.burnerKey ?? load(KEY_STORAGE);
+      if (!key) throw new Error("The demo key is missing; reconnect.");
+      signature = (await sdk.createAccount(key).signMessage({ message })) as `0x${string}`;
+    }
+    await assertSignedBy(message, signature, signer);
+    return [nonce, expiresAt, signature];
+  }
+
   private async read(functionName: string, args: Any[] = []): Promise<Any> {
     const client = await this.client(false);
     return normalize(await withBackoff(() => client.readContract({ address: this.contract, functionName, args })));
@@ -342,12 +376,15 @@ export class LiveBackend implements Backend {
 
   async createEscrow(_by: string, input: CreateEscrowInput): Promise<number> {
     const specs = input.milestones.map((m) => ({
-      title: m.title, reward: m.reward.toString(), expected_sha: m.expectedSha, check_name: m.checkName, app_id: m.appId, min_tests: m.minTests,
+      title: m.title, description: m.description, reward: m.reward.toString(), expected_sha: m.expectedSha, check_name: m.checkName, app_id: m.appId, min_tests: m.minTests,
       min_coverage_bps: m.minCoverageBps, deadline: m.deadline,
     }));
     const total = input.milestones.reduce((a, m) => a + m.reward, 0n);
     const before = (await this.stats()).escrowCount;
-    await this.write("create_escrow", [input.contractor, input.repo, input.branch, input.title, BigInt(input.bondBps), JSON.stringify(specs)], total);
+    await this.write("create_escrow", [
+      input.contractor, input.repositoryUrl.trim(), input.branch, input.title, BigInt(input.bondBps),
+      input.baselineCommitSha.trim().toLowerCase(), JSON.stringify(specs),
+    ], total);
     return before + 1;
   }
 
@@ -357,7 +394,12 @@ export class LiveBackend implements Backend {
   }
   async cancelEscrow(_by: string, escrowId: number) { await this.write("cancel_escrow", [BigInt(escrowId)]); }
   async settle(_by: string, id: number) { await this.write("settle_milestone", [BigInt(id)]); }
-  async approve(_by: string, id: number) { await this.write("approve_milestone", [BigInt(id)]); }
+  /** Employer's early release. The wallet signs an APPROVE authorization for the commit that was verified. */
+  async approve(_by: string, id: number) {
+    const m = toMilestone(await this.read("get_milestone", [BigInt(id)]));
+    const [nonce, expiresAt, signature] = await this.authorize("APPROVE", id, m.submittedSha, m.deliveryRef);
+    await this.write("approve_milestone", [BigInt(id), nonce, BigInt(expiresAt), signature]);
+  }
   async claimDefault(_by: string, id: number): Promise<string> {
     await this.write("claim_default", [BigInt(id)]);
     return (await this.read("get_milestone", [BigInt(id)])).status;
@@ -388,8 +430,12 @@ export class LiveBackend implements Backend {
     return { report, trace: traceFromReceipt(tx, report) };
   }
 
+  /** Contractor's delivery. The wallet signs a SUBMIT authorization the contract recovers and checks against the contractor. */
   async evaluate(_by: string, milestoneId: number, sha: string, deliveryRef = ""): Promise<Outcome> {
-    const tx = await this.write("evaluate_milestone_delivery", [BigInt(milestoneId), sha, deliveryRef]);
+    const commit = normalizeCommit(sha);
+    const ref = normalizeRef(deliveryRef);
+    const [nonce, expiresAt, signature] = await this.authorize("SUBMIT", milestoneId, commit, ref);
+    const tx = await this.write("evaluate_milestone_delivery", [BigInt(milestoneId), commit, ref, nonce, BigInt(expiresAt), signature]);
     return this.outcome(milestoneId, tx);
   }
 

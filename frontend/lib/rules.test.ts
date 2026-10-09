@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ATTO, fmtGen, parseGen } from "./format";
-import { bondFor, disputeBond, disputeFee, MAX_DISPUTES } from "./rules";
+import { bondFor, disputeBond, disputeFee, MAX_DISPUTES, validateBaseline, validateRepositoryUrl } from "./rules";
 
 test("bond math: 15% of 100 GEN", () => {
   assert.equal(bondFor(100n * ATTO, 1500), 15n * ATTO);
@@ -30,4 +30,14 @@ test("GEN formatting round-trips", () => {
 test("dispute fee is 3% of the reward with a 0.02 GEN floor", () => {
   assert.equal(disputeFee(100n * ATTO), 3n * ATTO);
   assert.equal(disputeFee(ATTO / 10n), ATTO / 50n);
+});
+
+test("create-form validation mirrors the contract's repository_url and baseline rules", () => {
+  assert.equal(validateRepositoryUrl("https://github.com/acme/widgets"), null);
+  for (const bad of ["acme/widgets", "https://github.com/acme/widgets.git", "https://github.com/acme/widgets/", "http://github.com/acme/widgets", "https://gitlab.com/acme/widgets", "https://github.com/a/b/../c"]) {
+    assert.ok(validateRepositoryUrl(bad), bad);
+  }
+  assert.equal(validateBaseline("c".repeat(40)), null);
+  assert.equal(validateBaseline(` ${"C".repeat(40)} `), null); // trimmed and lower-cased before sending
+  for (const bad of ["", "abc", "g".repeat(40), "c".repeat(39), "c".repeat(41)]) assert.ok(validateBaseline(bad), bad);
 });

@@ -9,7 +9,7 @@ import type { Escrow, Milestone, Outcome } from "@/lib/types";
 import { Section, StatusChip } from "./ui";
 
 export function MilestoneProgress({ escrow, selectedId, onSelect }: { escrow: Escrow; selectedId: number; onSelect(id: number): void }) {
-  const released = escrow.milestones.filter((m) => m.status === "RELEASED").length;
+  const released = escrow.milestones.filter((m) => m.status === "FINALIZED").length;
   const pct = Math.round((released / escrow.milestones.length) * 100);
   return (
     <Section title="Milestone inspector" hint="Funds move only when a validator quorum confirms the deliverable on GitHub."
@@ -40,7 +40,8 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
   const isContractor = actorAddress.toLowerCase() === escrow.contractor.toLowerCase();
   const expired = snap.now > m.deadline;
   const frozen = m.status === "FROZEN_EXTERNAL_FAULT";
-  const canDeliver = escrow.status === "ACTIVE" && (m.status === "PENDING" || frozen) && isContractor && (frozen || !expired) && m.attempts < MAX_ATTEMPTS;
+  const awaiting = m.status === "FUNDED" || m.status === "DISPUTED";
+  const canDeliver = escrow.status === "ACTIVE" && (awaiting || frozen) && isContractor && (frozen || !expired) && m.attempts < MAX_ATTEMPTS;
 
   async function deliver() {
     const out = await run(() => backend.evaluate(actorAddress, m.id, sha || m.expectedSha, ref.trim()));
@@ -51,6 +52,11 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
 
   return (
     <Section title={`M${m.index + 1} · ${m.title}`} hint={`${escrow.repo} @ ${escrow.branch}`} right={<StatusChip status={m.status} />}>
+      {m.description && (
+        <p className="mb-3 rounded-xl bg-ink-850 p-3 text-xs leading-relaxed text-zinc-300 ring-1 ring-white/5">
+          <span className="label mr-2">Milestone criteria</span>{m.description}
+        </p>
+      )}
       <dl className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
         <Criterion icon={<Target size={14} />} label="Reward / bond" value={`${fmtGen(m.reward)} / ${fmtGen(m.bond)} GEN`} />
         <Criterion icon={<FileCode2 size={14} />} label="Min passing tests" value={String(m.minTests)} />
@@ -60,12 +66,14 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
       <div className="mt-2 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
         <Criterion label="Critical findings" value="0 allowed" />
         <Criterion label="Attested check-run" value={`${m.checkName} · app ${m.appId}`} />
-        <Criterion label="Deadline" value={fmtDate(m.deadline)} tone={expired && m.status === "PENDING" && snap.now > m.resubmitUntil ? "bad" : undefined} />
+        <Criterion label="Deadline" value={fmtDate(m.deadline)} tone={expired && awaiting && snap.now > m.resubmitUntil ? "bad" : undefined} />
         <Criterion label="Attempts" value={`${m.attempts} / ${MAX_ATTEMPTS}${m.pendingPolls ? ` · ${m.pendingPolls} CI polls` : ""}`} />
+        <Criterion icon={<GitCommitHorizontal size={14} />} label="Baseline (must descend from)" value={escrow.baselineCommitSha ? shortSha(escrow.baselineCommitSha) : "—"} />
+        <Criterion label="Held by contract" value={`${fmtGen(m.escrowed)} GEN`} />
         <Criterion label="Submitted" value={m.submittedSha ? `${shortSha(m.submittedSha)}${m.deliveryRef ? ` @ ${m.deliveryRef}` : ""}` : "—"} />
       </div>
 
-      {(m.status === "PENDING" || frozen) && (
+      {(awaiting || frozen) && (
         <div className="mt-5 rounded-xl bg-ink-850 p-4 ring-1 ring-white/5">
           <div className="label">Deliverable submission</div>
           <div className="mt-2 flex flex-col gap-2 md:flex-row">
@@ -73,12 +81,13 @@ export function MilestoneDetail({ escrow, m, actorAddress, onOutcome }: { escrow
               placeholder={m.expectedSha || "full 40-character commit SHA"} aria-label="Commit SHA" />
             <button className="btn-primary whitespace-nowrap" disabled={!canDeliver || busy} onClick={deliver}><Play size={14} /> Verify on-chain</button>
           </div>
+          <p className="mt-2 text-[11px] text-zinc-500">Your wallet will ask you to sign an authorization (no gas) binding this commit, milestone, nonce and expiry; the contract recovers the signer and only accepts the registered contractor.</p>
           <input className="input mt-2 font-mono text-xs" value={ref} onChange={(e) => setRef(e.target.value)} disabled={!canDeliver}
             placeholder="delivery ref (optional): empty = target branch · pull/7 = unmerged PR head · feature/x" aria-label="Delivery ref" />
           {!isContractor && <p className="mt-2 text-xs text-zinc-500">Only the contractor can submit a commit. Switch persona to submit.</p>}
           {isContractor && escrow.status !== "ACTIVE" && <p className="mt-2 text-xs text-warn">Post the performance bond first to activate this escrow.</p>}
-          {expired && m.status === "PENDING" && snap.now <= m.resubmitUntil && <p className="mt-2 text-xs text-warn">Resubmit grace window: the deadline was extended after an overturned delivery.</p>}
-          {expired && m.status === "PENDING" && snap.now > m.resubmitUntil && <p className="mt-2 text-xs text-bad">Deadline passed — the employer may claim a default.</p>}
+          {expired && awaiting && snap.now <= m.resubmitUntil && <p className="mt-2 text-xs text-warn">Resubmit grace window: the deadline was extended after an overturned delivery.</p>}
+          {expired && awaiting && snap.now > m.resubmitUntil && <p className="mt-2 text-xs text-bad">Deadline passed — the employer may claim a default.</p>}
           {frozen && <p className="mt-2 text-xs text-warn">Frozen: the repository was unreachable. Submitting again revives the milestone once it answers.</p>}
         </div>
       )}

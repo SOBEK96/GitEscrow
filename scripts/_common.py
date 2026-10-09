@@ -26,6 +26,7 @@ KEY_DIR = ROOT / "deployments" / ".keys"
 RPC_URL = os.environ.get("GITESCROW_RPC_URL", "https://studio-next.genlayer.com/api")
 EXPLORER_URL = "https://explorer-studio-next.genlayer.com"
 ATTO = 10**18
+SIGNING_CHAIN_ID = 61997  # Studio Next; passed to the contract constructor and bound into every signature
 
 
 def chain():
@@ -80,10 +81,14 @@ def is_success(receipt: Any) -> bool:
     return agreed and executed
 
 
+LAST_TX = {"hash": ""}  # hash of the most recent transaction sent, kept even when it is rejected
+
+
 def send(c, address: str, fn: str, args: list, value: int = 0, label: str | None = None) -> dict:
     """Write through consensus, wait for the decision, fail loudly on a bad status."""
     fees = retry(lambda: c.estimate_transaction_fees())
     tx_hash = retry(lambda: c.write_contract(address=address, function_name=fn, args=args, value=value, fees=fees))
+    LAST_TX["hash"] = tx_hash if isinstance(tx_hash, str) else "0x" + bytes(tx_hash).hex().removeprefix("0x")
     receipt = c.wait_for_transaction_receipt(transaction_hash=tx_hash, wait_until="decided", retries=200, interval=3000)
     ok = is_success(receipt)
     print(f"  {'OK ' if ok else 'ERR'} {label or fn}  tx={tx_hash if isinstance(tx_hash, str) else tx_hash.hex()}")
@@ -120,3 +125,44 @@ def load_deployment() -> dict:
 
 def now() -> int:
     return int(time.time())
+
+
+def authorization_message(contract: str, action: str, milestone_id: int, commit_sha: str, delivery_ref: str,
+                          nonce: int, expires_at: int, chain_id: int = SIGNING_CHAIN_ID) -> str:
+    """The exact text the contract asks a wallet to sign (see authorization_message in git_escrow.py)."""
+    return "\n".join([
+        "GitEscrow authorization v1",
+        f"action: {action}",
+        f"chain: {chain_id}",
+        f"contract: {contract.lower()}",
+        f"milestone: {milestone_id}",
+        f"commit: {commit_sha.strip().lower()}",
+        f"ref: {delivery_ref.strip()}",
+        f"nonce: {nonce}",
+        f"expires: {expires_at}",
+    ])
+
+
+def sign_authorization(role: str, c, contract: str, action: str, milestone_id: int, commit_sha: str,
+                       delivery_ref: str = "", ttl: int = 3600) -> tuple[int, int, str]:
+    """Sign an authorization with the role's key (EIP-191 personal_sign, like an injected wallet would).
+
+    Returns (nonce, expires_at, signature) ready for evaluate_milestone_delivery / approve_milestone."""
+    from eth_account.messages import encode_defunct
+
+    acct = account(role)
+    nonce = int(view(c, contract, "get_nonce", [acct.address]))
+    expires_at = now() + ttl
+    text = authorization_message(contract, action, milestone_id, commit_sha, delivery_ref, nonce, expires_at)
+    signed = acct.sign_message(encode_defunct(text=text))
+    return nonce, expires_at, "0x" + bytes(signed.signature).hex()
+
+
+def github_head(repo: str, branch: str) -> str:
+    """Current head commit of a public branch (unauthenticated GitHub API)."""
+    import urllib.request
+
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/commits/{branch}",
+                                 headers={"User-Agent": "GitEscrow-scripts", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)["sha"]

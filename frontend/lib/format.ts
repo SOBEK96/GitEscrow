@@ -51,8 +51,16 @@ export function fmtDate(ts: number): string {
 
 export const FAILURE_LABELS: Record<string, string> = {
   repo_unavailable: "Repository is deleted, private or unreachable (external fault)",
-  commit_not_found: "Commit does not exist on the repository",
-  spoofed_payload: "Spoofed payload: commit belongs to another repository",
+  commit_not_found: "Commit does not exist on the bound repository (rejected, nothing recorded)",
+  spoofed_payload: "Spoofed payload: commit belongs to another repository (rejected, nothing recorded)",
+  not_descendant_of_baseline: "Commit is not a strict descendant of the escrow's baseline commit (rejected, nothing recorded)",
+  ci_config_tampered: "The delivery modifies CI/workflow files under .github/ (rejected, nothing recorded)",
+  tests_removed: "The delivery deletes or relocates existing test files (rejected, nothing recorded)",
+  rigged_tests: "The delivery adds an always-green construct to tests or test tooling (rejected, nothing recorded)",
+  ci_provenance_rejected: "Reviewer quorum judged the CI output not to come from genuinely exercising the milestone (rejected)",
+  milestone_not_implemented: "Reviewer quorum judged the diff not to implement the milestone description",
+  diff_too_large: "The baseline...delivery diff is too large to audit (300+ files) or unavailable",
+  review_missing: "Provenance review did not run",
   SPOOFED_REPORT_PAYLOAD: "report.json contradicts the authentic CI check-run output",
   commit_not_on_ref: "Commit is not part of the delivery ref (target branch, branch or PR head)",
   ci_pending: "Attested check-run still running (no attempt consumed)",

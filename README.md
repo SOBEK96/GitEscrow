@@ -14,6 +14,29 @@ deployments/              recorded Studio Next deployment
 
 ---
 
+## Live Network Proof (Explorer Links)
+
+A complete funded lifecycle executed against the deployed contract on GenLayer Studio Next (chain `61997`, run with `scripts/verify_live.py lifecycle --skip-probes`). Contract: [`0x2F0186CF5CF4276409b4b4eF4b6525Ce474B096D`](https://explorer-studio-next.genlayer.com/address/0x2F0186CF5CF4276409b4b4eF4b6525Ce474B096D). Repository: [`moltaphet/gitescrow-evidence-demo`](https://github.com/moltaphet/gitescrow-evidence-demo), baseline `880d4cb`, delivery `c3b9771` (green `ci/tests` check-run: 4 passed, 0 failed, 100% branch coverage, 0 critical issues).
+
+| Step | Transaction | Explorer link |
+|---|---|---|
+| 1. Funding - employer deposits the 1 GEN milestone reward | `create_escrow` | [tx](https://explorer-studio-next.genlayer.com/tx/0xcb6ce04e5315ebb2b08a86054ab67c5c9b06ef8c17a4d3263b6af552df1ccfee) |
+| 2. Bonding - contractor posts the 15% (0.15 GEN) performance bond | `accept_escrow` | [tx](https://explorer-studio-next.genlayer.com/tx/0x4f52c0b96826393d4be25c0a4db68d0c665754b68b74c8355d700619ee673fd9) |
+| 3. Verified delivery - validator consensus checks the commit on GitHub (`passed=True`, `failures=[]`) | `evaluate_milestone_delivery` | [tx](https://explorer-studio-next.genlayer.com/tx/0x01153f9c2167373f7771f821f602058167aea0fcb43605dc5a519b180e561861) |
+| 4. Finalization & payout - employer approval pays reward + returns bond (1.15 GEN to the contractor, 0 GEN left held) | `approve_milestone` | [tx](https://explorer-studio-next.genlayer.com/tx/0xbff8ee9726795591aa5f83cda50c392fb6d5828ad336094ceaf91b10a49f1323) |
+
+Double-payout attempts on the finalized milestone, each rejected by the contract (ledger unchanged, `solvent=True`):
+
+| Attempt | Explorer link |
+|---|---|
+| `settle_milestone` on a finalized milestone | [tx](https://explorer-studio-next.genlayer.com/tx/0x6cd826ed5dc6caf6902f3fda0191d2fcd2d8caab81570968ae5a86685850ef41) |
+| `approve_milestone` a second time | [tx](https://explorer-studio-next.genlayer.com/tx/0x87aceced8501d87c2f02059c3aaeee216490905822497392d0ef2b8b47b6588e) |
+| `evaluate_milestone_delivery` re-submission | [tx](https://explorer-studio-next.genlayer.com/tx/0xbaef4359b1c8efd60f243d670d23409c3e60714574759bfc81d2109f9067debe) |
+
+Final ledger after this run: in 2.3000 GEN, out 2.3000 GEN, held 0.0000 GEN. The adversarial pre-baseline / foreign-repository probes were skipped in this run (`--skip-probes`).
+
+---
+
 ## Architecture
 
 ```mermaid
